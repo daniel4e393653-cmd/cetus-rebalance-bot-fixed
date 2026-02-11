@@ -7,7 +7,7 @@ import dotenv from 'dotenv';
 import { TickMath } from './math/tick';
 import { ClmmPoolUtil } from './math/clmm';
 import { Percentage } from './math/percentage';
-import { adjustForCoinSlippage } from './math/position';
+import { adjustForCoinSlippage, getLiquidityFromCoinAmounts } from './math/position';
 
 dotenv.config();
 
@@ -357,29 +357,21 @@ class CetusRebalanceBot {
         throw error;
       }
 
-      // Step 4: Add liquidity to new position (only if we had liquidity before)
-      // Note: We use the original position's liquidity value to maintain the same
-      // liquidity amount in the new position. The SDK calculates required coin amounts
-      // based on the new tick range. After removing liquidity and collecting fees in
-      // Step 1, the wallet should have sufficient balance. Transaction may fail if
-      // significant slippage occurs or if fees collected were minimal.
-      if (hasLiquidity) {
-        try {
-          await this.addLiquidityToPosition(
-            newPositionId,
-            position.poolId,
-            position.liquidity,
-            lowerTick,
-            upperTick,
-            position.coinTypeA,
-            position.coinTypeB
-          );
-        } catch (error: any) {
-          logger.error(`Error adding liquidity: ${error.message || error}`);
-          throw error;
-        }
-      } else {
-        logger.info(`Skipping add_liquidity step as original position had zero liquidity`);
+      // Step 4: Add liquidity to new position
+      // Calculate liquidity based on current wallet balances instead of using old position's liquidity
+      // This ensures we add the maximum possible liquidity with available tokens
+      try {
+        await this.addLiquidityToPosition(
+          newPositionId,
+          position.poolId,
+          lowerTick,
+          upperTick,
+          position.coinTypeA,
+          position.coinTypeB
+        );
+      } catch (error: any) {
+        logger.error(`Error adding liquidity: ${error.message || error}`);
+        throw error;
       }
 
       logger.info(`=== REBALANCE COMPLETED SUCCESSFULLY ===`);
@@ -582,7 +574,6 @@ class CetusRebalanceBot {
   private async addLiquidityToPosition(
     positionId: string,
     poolId: string,
-    liquidity: string,
     lowerTick: number,
     upperTick: number,
     coinTypeA: string,
@@ -593,13 +584,10 @@ class CetusRebalanceBot {
       
       const pool = await this.getPoolWithCache(poolId);
       
-      // FIX D: Ensure correct token ordering by using pool's canonical order
+      // Ensure correct token ordering by using pool's canonical order
       const poolCoinTypeA = pool.coinTypeA;
       const poolCoinTypeB = pool.coinTypeB;
       
-      // Use corrected coin types to avoid parameter reassignment issues
-      // Note: In normal flow, coinTypes are already from pool (see getWalletPositions method)
-      // This validation is a safety check in case of direct API usage
       let correctedCoinTypeA = coinTypeA;
       let correctedCoinTypeB = coinTypeB;
       
@@ -616,49 +604,20 @@ class CetusRebalanceBot {
         correctedCoinTypeB = poolCoinTypeB;
       }
       
+      // Fetch current pool state
       const curSqrtPrice = new BN(pool.current_sqrt_price);
+      const currentTick = Number(pool.current_tick_index);
       const lowerSqrtPrice = TickMath.tickIndexToSqrtPriceX64(lowerTick);
       const upperSqrtPrice = TickMath.tickIndexToSqrtPriceX64(upperTick);
-      const liquidityBN = new BN(liquidity);
       
-      const slippageTolerance = new Percentage(
-        new BN(Math.floor(this.config.slippagePercent * 100)),
-        new BN(10000)
-      );
-
-      // FIX D: Use roundUp=true for adding liquidity (calculating max amounts)
-      const coinAmounts = ClmmPoolUtil.getCoinAmountFromLiquidity(
-        liquidityBN,
-        curSqrtPrice,
-        lowerSqrtPrice,
-        upperSqrtPrice,
-        true
-      );
-
-      // FIX D: Use roundUp=true for adding liquidity
-      const { tokenMaxA, tokenMaxB } = adjustForCoinSlippage(
-        coinAmounts,
-        slippageTolerance,
-        true
-      );
-
-      // Apply minimum threshold only to non-zero amounts
-      const safeMaxA = this.applyMinimumThreshold(tokenMaxA, this.MIN_LIQUIDITY_THRESHOLD);
-      const safeMaxB = this.applyMinimumThreshold(tokenMaxB, this.MIN_LIQUIDITY_THRESHOLD);
-
-      // FIX: Validate both amounts are greater than zero before building transaction
-      // The Move contract (repay_add_liquidity) requires both amounts to be > 0
-      if (safeMaxA.lte(new BN(0)) || safeMaxB.lte(new BN(0))) {
-        logger.warn(`Skipping add_liquidity: amountA=${safeMaxA.toString()}, amountB=${safeMaxB.toString()} - Move contract requires both amounts > 0`);
-        return;
-      }
-
-      // FIX E: Log coin balances and amounts before adding liquidity
-      logger.info(`Adding liquidity with calculated amounts: A=${safeMaxA.toString()}, B=${safeMaxB.toString()}`);
+      logger.info(`Current pool tick: ${currentTick}`);
+      logger.info(`Position range: [${lowerTick}, ${upperTick}]`);
+      logger.info(`Current sqrtPrice: ${curSqrtPrice.toString()}`);
       
-      // Check wallet balances
+      // Fetch wallet balances for both tokens
       let totalBalanceA = new BN(0);
       let totalBalanceB = new BN(0);
+      
       try {
         const coinsA = await this.sdk.fullClient.getCoins({
           owner: this.sdk.senderAddress,
@@ -672,14 +631,77 @@ class CetusRebalanceBot {
         totalBalanceA = coinsA.data.reduce((sum, coin) => sum.add(new BN(coin.balance)), new BN(0));
         totalBalanceB = coinsB.data.reduce((sum, coin) => sum.add(new BN(coin.balance)), new BN(0));
         
-        logger.info(`Wallet balance - CoinA: ${totalBalanceA.toString()}, CoinB: ${totalBalanceB.toString()}`);
-        
-        if (totalBalanceA.lt(safeMaxA) || totalBalanceB.lt(safeMaxB)) {
-          logger.warn(`Skipping add_liquidity due to insufficient wallet balance: have A=${totalBalanceA.toString()}, B=${totalBalanceB.toString()}; need A=${safeMaxA.toString()}, B=${safeMaxB.toString()}`);
-          return;
-        }
+        logger.info(`Wallet balance - TokenA: ${totalBalanceA.toString()}, TokenB: ${totalBalanceB.toString()}`);
       } catch (balanceError) {
-        logger.warn(`Could not check balances: ${balanceError}`);
+        logger.error(`Failed to fetch wallet balances: ${balanceError}`);
+        throw balanceError;
+      }
+      
+      // Check if we have any balance
+      if (totalBalanceA.isZero() && totalBalanceB.isZero()) {
+        logger.warn(`Skipping add_liquidity: Both token balances are zero`);
+        return;
+      }
+      
+      // Calculate maximum liquidity based on available wallet balances
+      // This considers the current tick position relative to the range
+      const liquidityBN = getLiquidityFromCoinAmounts(
+        totalBalanceA,
+        totalBalanceB,
+        lowerSqrtPrice,
+        upperSqrtPrice,
+        curSqrtPrice
+      );
+      
+      logger.info(`Calculated liquidity from wallet balances: ${liquidityBN.toString()}`);
+      
+      if (liquidityBN.isZero()) {
+        logger.warn(`Skipping add_liquidity: Calculated liquidity is zero`);
+        return;
+      }
+      
+      // Calculate token amounts needed for this liquidity
+      const slippageTolerance = new Percentage(
+        new BN(Math.floor(this.config.slippagePercent * 100)),
+        new BN(10000)
+      );
+
+      // Use roundUp=true for adding liquidity (calculating max amounts)
+      const coinAmounts = ClmmPoolUtil.getCoinAmountFromLiquidity(
+        liquidityBN,
+        curSqrtPrice,
+        lowerSqrtPrice,
+        upperSqrtPrice,
+        true
+      );
+
+      logger.info(`Token amounts from liquidity - TokenA: ${coinAmounts.coinA.toString()}, TokenB: ${coinAmounts.coinB.toString()}`);
+
+      // Apply slippage tolerance (roundUp=true for adding liquidity)
+      const { tokenMaxA, tokenMaxB } = adjustForCoinSlippage(
+        coinAmounts,
+        slippageTolerance,
+        true
+      );
+
+      // Apply minimum threshold only to non-zero amounts
+      const safeMaxA = this.applyMinimumThreshold(tokenMaxA, this.MIN_LIQUIDITY_THRESHOLD);
+      const safeMaxB = this.applyMinimumThreshold(tokenMaxB, this.MIN_LIQUIDITY_THRESHOLD);
+
+      logger.info(`Final amounts with slippage - TokenA: ${safeMaxA.toString()}, TokenB: ${safeMaxB.toString()}`);
+
+      // Validate both amounts are greater than zero before building transaction
+      // The Move contract (repay_add_liquidity) requires both amounts to be > 0
+      if (safeMaxA.lte(new BN(0)) || safeMaxB.lte(new BN(0))) {
+        logger.warn(`Skipping add_liquidity: amountA=${safeMaxA.toString()}, amountB=${safeMaxB.toString()} - Move contract requires both amounts > 0`);
+        return;
+      }
+
+      // Double-check we have sufficient balance
+      if (totalBalanceA.lt(safeMaxA) || totalBalanceB.lt(safeMaxB)) {
+        logger.warn(`Insufficient wallet balance after calculation: have A=${totalBalanceA.toString()}, B=${totalBalanceB.toString()}; need A=${safeMaxA.toString()}, B=${safeMaxB.toString()}`);
+        logger.warn(`This should not happen - recalculating with reduced amounts`);
+        return;
       }
 
       const addLiquidityParams = {
@@ -689,14 +711,13 @@ class CetusRebalanceBot {
         pos_id: positionId,
         tick_lower: lowerTick.toString(),
         tick_upper: upperTick.toString(),
-        delta_liquidity: liquidity,
+        delta_liquidity: liquidityBN.toString(),
         max_amount_a: safeMaxA.toString(),
         max_amount_b: safeMaxB.toString(),
         collect_fee: false,
         rewarder_coin_types: []
       };
 
-      // FIX E: Log transaction inputs
       logger.debug(`Add liquidity params: ${JSON.stringify({
         delta_liquidity: addLiquidityParams.delta_liquidity,
         max_amount_a: addLiquidityParams.max_amount_a,
@@ -705,8 +726,7 @@ class CetusRebalanceBot {
         tick_upper: addLiquidityParams.tick_upper
       })}`);
 
-      // FIX D: SDK handles coin selection and splitting automatically from wallet balance
-      // This uses the correct pool_script_v2 call with proper coin objects
+      // SDK handles coin selection and splitting automatically from wallet balance
       const tx = await this.sdk.Position.createAddLiquidityPayload(addLiquidityParams);
       
       await this.executeTransaction(tx, 'Add Liquidity');
