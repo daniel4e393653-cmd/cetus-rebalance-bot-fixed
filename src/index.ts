@@ -53,6 +53,20 @@ interface PositionFields {
   liquidity: string;
 }
 
+/**
+ * Type guard to validate PositionFields structure
+ */
+function isPositionFields(fields: any): fields is PositionFields {
+  return (
+    typeof fields === 'object' &&
+    fields !== null &&
+    typeof fields.pool === 'string' &&
+    (typeof fields.tick_lower_index === 'string' || typeof fields.tick_lower_index === 'number') &&
+    (typeof fields.tick_upper_index === 'string' || typeof fields.tick_upper_index === 'number') &&
+    typeof fields.liquidity === 'string'
+  );
+}
+
 class CetusRebalanceBot {
   private sdk: CetusClmmSDK;
   private keypair: Ed25519Keypair;
@@ -65,6 +79,9 @@ class CetusRebalanceBot {
   // Minimum threshold in raw units (1 = smallest unit, e.g., 1 = 10^-decimals of a full token)
   // This prevents completely zero amounts but allows single-sided positions
   private readonly MIN_LIQUIDITY_THRESHOLD = new BN(1);
+  private readonly POSITION_FETCH_INITIAL_DELAY = 1000; // 1 second initial delay
+  private readonly POSITION_FETCH_RETRY_DELAY = 2000; // 2 seconds between retries
+  private readonly POSITION_FETCH_MAX_RETRIES = 5;
 
   constructor(config: RebalanceConfig) {
     this.config = config;
@@ -481,21 +498,19 @@ class CetusRebalanceBot {
       logger.debug('Fetching position objects from wallet to find address-owned NFT...');
       
       // Retry mechanism to wait for position to be indexed
-      const maxRetries = 5;
-      const retryDelay = 2000; // 2 seconds
       let newPositionId = '';
       
-      for (let attempt = 0; attempt < maxRetries; attempt++) {
+      for (let attempt = 0; attempt < this.POSITION_FETCH_MAX_RETRIES; attempt++) {
         if (attempt > 0) {
-          logger.debug(`Retry ${attempt}/${maxRetries} - waiting for position to be indexed...`);
+          logger.debug(`Retry ${attempt}/${this.POSITION_FETCH_MAX_RETRIES} - waiting for position to be indexed...`);
         }
         
         // Wait before fetching (skip on first attempt if it's the first try)
         if (attempt > 0) {
-          await new Promise(resolve => setTimeout(resolve, retryDelay));
+          await new Promise(resolve => setTimeout(resolve, this.POSITION_FETCH_RETRY_DELAY));
         } else {
           // Small initial wait to allow for indexing
-          await new Promise(resolve => setTimeout(resolve, 1000));
+          await new Promise(resolve => setTimeout(resolve, this.POSITION_FETCH_INITIAL_DELAY));
         }
         
         // Fetch all owned objects to find the newly created position
@@ -512,7 +527,7 @@ class CetusRebalanceBot {
         });
 
         if (!ownedObjects.data || ownedObjects.data.length === 0) {
-          if (attempt === maxRetries - 1) {
+          if (attempt === this.POSITION_FETCH_MAX_RETRIES - 1) {
             throw new Error('No position objects found in wallet after opening position');
           }
           continue;
@@ -521,7 +536,13 @@ class CetusRebalanceBot {
         // Find the position that matches our pool and tick range
         for (const obj of ownedObjects.data) {
           if (obj.data && obj.data.content && 'fields' in obj.data.content) {
-            const fields = obj.data.content.fields as unknown as PositionFields;
+            const fields = obj.data.content.fields;
+            
+            // Runtime validation of fields structure
+            if (!isPositionFields(fields)) {
+              logger.debug('Skipping object with invalid position fields structure');
+              continue;
+            }
             
             // Check if this position matches our pool and tick range
             if (
