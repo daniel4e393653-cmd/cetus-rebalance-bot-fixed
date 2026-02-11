@@ -46,26 +46,6 @@ interface PositionInfo {
   coinTypeB: string;
 }
 
-interface PositionFields {
-  pool: string;
-  tick_lower_index: string | number;
-  tick_upper_index: string | number;
-  liquidity: string;
-}
-
-/**
- * Type guard to validate PositionFields structure
- */
-function isPositionFields(fields: any): fields is PositionFields {
-  return (
-    typeof fields === 'object' &&
-    fields !== null &&
-    typeof fields.pool === 'string' &&
-    (typeof fields.tick_lower_index === 'string' || typeof fields.tick_lower_index === 'number') &&
-    (typeof fields.tick_upper_index === 'string' || typeof fields.tick_upper_index === 'number') &&
-    typeof fields.liquidity === 'string'
-  );
-}
 
 class CetusRebalanceBot {
   private sdk: CetusClmmSDK;
@@ -79,9 +59,6 @@ class CetusRebalanceBot {
   // Minimum threshold in raw units (1 = smallest unit, e.g., 1 = 10^-decimals of a full token)
   // This prevents completely zero amounts but allows single-sided positions
   private readonly MIN_LIQUIDITY_THRESHOLD = new BN(1);
-  private readonly POSITION_FETCH_INITIAL_DELAY = 1000; // 1 second initial delay
-  private readonly POSITION_FETCH_RETRY_DELAY = 2000; // 2 seconds between retries
-  private readonly POSITION_FETCH_MAX_RETRIES = 5;
 
   constructor(config: RebalanceConfig) {
     this.config = config;
@@ -253,7 +230,7 @@ class CetusRebalanceBot {
   /**
    * Execute a transaction with proper signing and simulation
    */
-  private async executeTransaction(tx: Transaction, description: string): Promise<{ digest: string; effects?: any }> {
+  private async executeTransaction(tx: Transaction, description: string): Promise<{ digest: string; effects?: any; objectChanges?: any[] }> {
     try {
       logger.info(`Executing transaction: ${description}`);
       
@@ -305,7 +282,7 @@ class CetusRebalanceBot {
       // Wait for confirmation
       await this.waitForTransaction(result.digest);
       
-      return { digest: result.digest, effects: result.effects };
+      return { digest: result.digest, effects: result.effects, objectChanges: result.objectChanges || [] };
     } catch (error: any) {
       logger.error(`Transaction execution failed: ${error.message || error}`);
       throw error;
@@ -493,76 +470,34 @@ class CetusRebalanceBot {
       
       const result = await this.executeTransaction(tx, 'Open Position');
       
-      // After opening position, we need to fetch the actual address-owned position NFT
-      // from getOwnedObjects, as the transaction might return wrapped objects
-      logger.debug('Fetching position objects from wallet to find address-owned NFT...');
+      // Extract the newly created position object ID directly from transaction effects
+      // Cetus mints the position as an object owned by another object (not address-owned),
+      // so we extract it from objectChanges instead of trying to fetch via getOwnedObjects
+      logger.debug('Extracting position object ID from transaction effects...');
       
-      // Retry mechanism to wait for position to be indexed
+      if (!result.objectChanges || result.objectChanges.length === 0) {
+        throw new Error('Failed to retrieve position from transaction: no object changes returned. This may indicate the transaction did not complete successfully.');
+      }
+      
+      // Find the created object whose type matches the Cetus Position type
+      // Note: Position types include type parameters like Position<CoinA, CoinB>
       let newPositionId = '';
-      
-      for (let attempt = 0; attempt < this.POSITION_FETCH_MAX_RETRIES; attempt++) {
-        if (attempt > 0) {
-          logger.debug(`Attempt ${attempt + 1}/${this.POSITION_FETCH_MAX_RETRIES} - waiting for position to be indexed...`);
-        }
-        
-        // Wait before fetching to allow blockchain indexing
-        const delay = attempt === 0 ? this.POSITION_FETCH_INITIAL_DELAY : this.POSITION_FETCH_RETRY_DELAY;
-        await new Promise(resolve => setTimeout(resolve, delay));
-        
-        // Fetch all owned objects to find the newly created position
-        const ownedObjects = await this.sdk.fullClient.getOwnedObjects({
-          owner: this.sdk.senderAddress,
-          filter: {
-            StructType: `${this.sdk.sdkOptions.clmm_pool.package_id}::position::Position`
-          },
-          options: {
-            showType: true,
-            showOwner: true,
-            showContent: true
-          }
-        });
-
-        if (!ownedObjects.data || ownedObjects.data.length === 0) {
-          if (attempt === this.POSITION_FETCH_MAX_RETRIES - 1) {
-            throw new Error('No position objects found in wallet after opening position');
-          }
-          continue;
-        }
-
-        // Find the position that matches our pool and tick range
-        for (const obj of ownedObjects.data) {
-          if (obj.data && obj.data.content && 'fields' in obj.data.content) {
-            const fields = obj.data.content.fields;
-            
-            // Runtime validation of fields structure
-            if (!isPositionFields(fields)) {
-              logger.debug('Skipping object with invalid position fields structure');
-              continue;
-            }
-            
-            // Check if this position matches our pool and tick range
-            if (
-              fields.pool === poolId &&
-              Number(fields.tick_lower_index) === lowerTick &&
-              Number(fields.tick_upper_index) === upperTick &&
-              obj.data.owner && 
-              typeof obj.data.owner === 'object' && 
-              'AddressOwner' in obj.data.owner
-            ) {
-              newPositionId = obj.data.objectId;
-              logger.info(`Found address-owned position NFT: ${newPositionId}`);
-              break;
-            }
-          }
-        }
-        
-        if (newPositionId) {
+      const expectedPositionTypePrefix = `${this.sdk.sdkOptions.clmm_pool.package_id}::position::Position`;
+      for (const change of result.objectChanges) {
+        if (
+          change.type === 'created' &&
+          change.objectType &&
+          change.objectType.startsWith(expectedPositionTypePrefix)
+        ) {
+          newPositionId = change.objectId;
+          logger.info(`Found newly created position object: ${newPositionId}`);
           break;
         }
       }
-
+      
       if (!newPositionId) {
-        throw new Error('Could not find address-owned position NFT in wallet after opening position');
+        const foundTypes = result.objectChanges.map(c => c.objectType || 'unknown').join(', ');
+        throw new Error(`Could not find Position object in transaction object changes. Expected type prefix: ${expectedPositionTypePrefix}. Found types: ${foundTypes}`);
       }
 
       logger.info(`New position opened: ${newPositionId}`);
