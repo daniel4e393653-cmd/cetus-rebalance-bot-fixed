@@ -649,8 +649,7 @@ class CetusRebalanceBot {
       // FIX: Validate both amounts are greater than zero before building transaction
       // The Move contract (repay_add_liquidity) requires both amounts to be > 0
       if (safeMaxA.lte(new BN(0)) || safeMaxB.lte(new BN(0))) {
-        logger.warn(`Cannot add liquidity: amountA=${safeMaxA.toString()}, amountB=${safeMaxB.toString()}`);
-        logger.warn(`Skipping add_liquidity as one or both amounts are zero or negative`);
+        logger.warn(`Skipping add_liquidity: amountA=${safeMaxA.toString()}, amountB=${safeMaxB.toString()} - Move contract requires both amounts > 0`);
         return;
       }
 
@@ -676,8 +675,7 @@ class CetusRebalanceBot {
         logger.info(`Wallet balance - CoinA: ${totalBalanceA.toString()}, CoinB: ${totalBalanceB.toString()}`);
         
         if (totalBalanceA.lt(safeMaxA) || totalBalanceB.lt(safeMaxB)) {
-          logger.warn(`Insufficient balance: Need A=${safeMaxA.toString()}, B=${safeMaxB.toString()}`);
-          logger.warn(`Skipping add_liquidity due to insufficient wallet balance`);
+          logger.warn(`Skipping add_liquidity due to insufficient wallet balance: have A=${totalBalanceA.toString()}, B=${totalBalanceB.toString()}; need A=${safeMaxA.toString()}, B=${safeMaxB.toString()}`);
           return;
         }
       } catch (balanceError) {
