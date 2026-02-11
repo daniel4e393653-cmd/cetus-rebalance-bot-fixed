@@ -526,6 +526,18 @@ class CetusRebalanceBot {
       logger.info(`Step 4/4: Adding liquidity to position ${positionId}`);
       
       const pool = await this.getPoolWithCache(poolId);
+      
+      // FIX 1: Ensure correct token ordering by using pool's canonical order
+      const poolCoinTypeA = pool.coinTypeA;
+      const poolCoinTypeB = pool.coinTypeB;
+      
+      if (coinTypeA !== poolCoinTypeA || coinTypeB !== poolCoinTypeB) {
+        logger.warn(`Token order mismatch detected. Pool expects: A=${poolCoinTypeA}, B=${poolCoinTypeB}`);
+        logger.warn(`Correcting to use pool's canonical order...`);
+        coinTypeA = poolCoinTypeA;
+        coinTypeB = poolCoinTypeB;
+      }
+      
       const curSqrtPrice = new BN(pool.current_sqrt_price);
       const lowerSqrtPrice = TickMath.tickIndexToSqrtPriceX64(lowerTick);
       const upperSqrtPrice = TickMath.tickIndexToSqrtPriceX64(upperTick);
@@ -536,19 +548,33 @@ class CetusRebalanceBot {
         new BN(10000)
       );
 
+      // FIX 3: Use roundUp=true for adding liquidity (calculating max amounts)
       const coinAmounts = ClmmPoolUtil.getCoinAmountFromLiquidity(
         liquidityBN,
         curSqrtPrice,
         lowerSqrtPrice,
         upperSqrtPrice,
-        false
+        true
       );
 
+      // FIX 3: Use roundUp=true for adding liquidity
       const { tokenMaxA, tokenMaxB } = adjustForCoinSlippage(
         coinAmounts,
         slippageTolerance,
-        false
+        true
       );
+
+      // FIX 2: Validate amounts are not zero
+      if (tokenMaxA.isZero() && tokenMaxB.isZero()) {
+        throw new Error('Both token amounts are zero. Cannot add liquidity.');
+      }
+      
+      // Use a minimum threshold to avoid dust amounts
+      const minAmount = new BN(1);
+      const safeMaxA = tokenMaxA.gt(minAmount) ? tokenMaxA : minAmount;
+      const safeMaxB = tokenMaxB.gt(minAmount) ? tokenMaxB : minAmount;
+
+      logger.debug(`Calculated amounts: maxA=${safeMaxA.toString()}, maxB=${safeMaxB.toString()}`);
 
       const addLiquidityParams = {
         coinTypeA,
@@ -558,12 +584,15 @@ class CetusRebalanceBot {
         tick_lower: lowerTick.toString(),
         tick_upper: upperTick.toString(),
         delta_liquidity: liquidity,
-        max_amount_a: tokenMaxA.toString(),
-        max_amount_b: tokenMaxB.toString(),
+        max_amount_a: safeMaxA.toString(),
+        max_amount_b: safeMaxB.toString(),
         collect_fee: false,
         rewarder_coin_types: []
       };
 
+      // FIX 4 & 5: SDK handles coin selection automatically if inputCoinA/B not provided
+      // The SDK will select and split coins from wallet balance
+      // For production safety, we rely on SDK's built-in coin management
       const tx = await this.sdk.Position.createAddLiquidityPayload(addLiquidityParams);
       
       await this.executeTransaction(tx, 'Add Liquidity');
