@@ -459,7 +459,7 @@ class CetusRebalanceBot {
         pool_id: poolId
       };
 
-      const tx = this.sdk.Position.openPositionTransactionPayload(openPositionParams);
+      const tx = await this.sdk.Position.openPositionTransactionPayload(openPositionParams);
       
       const result = await this.executeTransaction(tx, 'Open Position');
       
