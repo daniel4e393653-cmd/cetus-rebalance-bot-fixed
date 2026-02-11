@@ -302,10 +302,10 @@ class CetusRebalanceBot {
   /**
    * Rebalance a single position
    */
-  async rebalancePosition(position: PositionInfo): Promise<void> {
+  async rebalancePosition(position: PositionInfo): Promise<string | undefined> {
     if (!this.config.rebalanceEnabled) {
       logger.info(`Rebalance disabled. Skipping rebalance for position ${position.positionId}`);
-      return;
+      return undefined;
     }
 
     try {
@@ -355,7 +355,7 @@ class CetusRebalanceBot {
             } catch (error: any) {
               logger.error(`Error closing position: ${error.message || error}`);
             }
-            return;
+            return undefined;
           }
         } catch (error: any) {
           logger.error(`Error removing liquidity: ${error.message || error}`);
@@ -372,7 +372,7 @@ class CetusRebalanceBot {
       } else {
         logger.info(`Position has zero liquidity, skipping remove_liquidity and close_position steps`);
         logger.warn(`No liquidity to rebalance, aborting rebalance operation`);
-        return;
+        return undefined;
       }
 
       // Step 3: Open new position
@@ -472,7 +472,7 @@ class CetusRebalanceBot {
         logger.error(`Error during balance check/swap: ${error.message || error}`);
         logger.error('Swap failed — aborting rebalance to prevent token imbalance issues');
         logger.warn(`New position ${newPositionId} was created but has no liquidity added`);
-        return;
+        return undefined;
       }
 
       // Step 4: Add liquidity to new position using final amounts
@@ -494,6 +494,7 @@ class CetusRebalanceBot {
 
       logger.info(`=== REBALANCE COMPLETED SUCCESSFULLY ===`);
       logger.info(`New position ID: ${newPositionId}`);
+      return newPositionId;
     } catch (error: any) {
       logger.error(`Error rebalancing position ${position.positionId}: ${error.message || error}`);
       throw error;
@@ -591,17 +592,17 @@ class CetusRebalanceBot {
         const balanceChanges = (txBlock as any).balanceChanges || result.balanceChanges || [];
         logger.info(`Balance changes count: ${balanceChanges.length}`);
         
+        // Normalize coin types once before the loop
+        const normalizedCoinTypeA = position.coinTypeA.replace(/^0x0*/, '0x');
+        const normalizedCoinTypeB = position.coinTypeB.replace(/^0x0*/, '0x');
+        
         for (const change of balanceChanges) {
           // Only consider positive changes to our wallet (tokens returned to us)
           const amount = BigInt(change.amount || '0');
           if (amount <= BigInt(0)) continue;
           
           const coinType = change.coinType || '';
-          
-          // Normalize coin type for comparison (remove leading 0x if needed)
           const normalizedCoinType = coinType.replace(/^0x0*/, '0x');
-          const normalizedCoinTypeA = position.coinTypeA.replace(/^0x0*/, '0x');
-          const normalizedCoinTypeB = position.coinTypeB.replace(/^0x0*/, '0x');
           
           if (normalizedCoinType === normalizedCoinTypeA) {
             onChainAmountA = onChainAmountA.add(new BN(amount.toString()));
@@ -865,7 +866,7 @@ class CetusRebalanceBot {
         // We'll scale down to prevent BN overflow
         const sqrtPriceHigh = curSqrtPrice.shrn(32); // scale down for safe multiplication
         const valueAScaled = balanceA.mul(sqrtPriceHigh).mul(sqrtPriceHigh).shrn(64); // final shift for 2^(32+32) = 2^64 remaining
-        const valueBScaled = balanceB.shln(0); // no scaling needed
+        const valueBScaled = balanceB; // already in B terms, no scaling needed
         
         const totalValue = valueAScaled.add(valueBScaled);
         const targetValueEach = totalValue.divn(2);
@@ -881,14 +882,18 @@ class CetusRebalanceBot {
           // Excess A, swap A -> B
           swapAtoB = true;
           const excessValue = valueAScaled.sub(targetValueEach);
-          // Convert excess value back to token A amount: excessA = excessValue / price
-          // excessA = excessValue * 2^64 / (sqrtPriceHigh^2) — but we need to avoid division by zero
+          // Convert excess value back to token A amount:
+          // Since valueA = balanceA * sqrtPriceHigh^2 / 2^64,
+          // excessTokenA = excessValue * 2^64 / sqrtPriceHigh^2
           const priceFactor = sqrtPriceHigh.mul(sqrtPriceHigh);
           if (priceFactor.isZero()) {
             logger.warn('Cannot compute swap amount: price factor is zero');
             return { newBalanceA: balanceA, newBalanceB: balanceB };
           }
-          swapAmount = excessValue.shln(64).div(priceFactor).muln(SAFETY_BUFFER_PERCENT).divn(100);
+          const excessTokenAmount = excessValue.shln(64).div(priceFactor);
+          // Apply 1% safety buffer (swap only 99% of excess)
+          const bufferedAmount = excessTokenAmount.muln(SAFETY_BUFFER_PERCENT).divn(100);
+          swapAmount = bufferedAmount;
           
           // Cap swap to never exceed available balance
           if (swapAmount.gt(balanceA)) {
@@ -900,7 +905,9 @@ class CetusRebalanceBot {
           swapAtoB = false;
           const excessValue = valueBScaled.sub(targetValueEach);
           // excessB is directly the excess value (already in B terms)
-          swapAmount = excessValue.muln(SAFETY_BUFFER_PERCENT).divn(100);
+          // Apply 1% safety buffer (swap only 99% of excess)
+          const bufferedAmount = excessValue.muln(SAFETY_BUFFER_PERCENT).divn(100);
+          swapAmount = bufferedAmount;
           
           // Cap swap to never exceed available balance
           if (swapAmount.gt(balanceB)) {
@@ -1223,26 +1230,31 @@ class CetusRebalanceBot {
               continue;
             }
             
-            await this.rebalancePosition(position);
+            const newPositionId = await this.rebalancePosition(position);
             
             // PART 4: Record rebalance timestamp
             this.lastRebalanceTimestamp.set(position.positionId, Date.now());
             
             // PART 4: Post-rebalance validation — re-fetch positions and verify
             // If the new position is already in range, log success
-            try {
-              const updatedPositions = await this.getWalletPositions();
-              const newPos = updatedPositions.find(p => p.poolId === position.poolId);
-              if (newPos) {
-                const stillOutOfRange = await this.isPositionOutOfRange(newPos);
-                if (stillOutOfRange) {
-                  logger.warn(`Post-rebalance check: New position ${newPos.positionId} is still out of range`);
-                } else {
-                  logger.info(`Post-rebalance check: New position ${newPos.positionId} is now in range`);
+            if (newPositionId) {
+              // Also record cooldown for the new position to prevent immediate re-rebalance
+              this.lastRebalanceTimestamp.set(newPositionId, Date.now());
+              
+              try {
+                const updatedPositions = await this.getWalletPositions();
+                const newPos = updatedPositions.find(p => p.positionId === newPositionId);
+                if (newPos) {
+                  const stillOutOfRange = await this.isPositionOutOfRange(newPos);
+                  if (stillOutOfRange) {
+                    logger.warn(`Post-rebalance check: New position ${newPos.positionId} is still out of range`);
+                  } else {
+                    logger.info(`Post-rebalance check: New position ${newPos.positionId} is now in range`);
+                  }
                 }
+              } catch (postCheckError: any) {
+                logger.warn(`Post-rebalance validation failed: ${postCheckError.message || postCheckError}`);
               }
-            } catch (postCheckError: any) {
-              logger.warn(`Post-rebalance validation failed: ${postCheckError.message || postCheckError}`);
             }
           } else {
             logger.info(`Position ${position.positionId} is IN RANGE`);
