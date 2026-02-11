@@ -46,6 +46,13 @@ interface PositionInfo {
   coinTypeB: string;
 }
 
+interface PositionFields {
+  pool: string;
+  tick_lower_index: string | number;
+  tick_upper_index: string | number;
+  liquidity: string;
+}
+
 class CetusRebalanceBot {
   private sdk: CetusClmmSDK;
   private keypair: Ed25519Keypair;
@@ -473,45 +480,67 @@ class CetusRebalanceBot {
       // from getOwnedObjects, as the transaction might return wrapped objects
       logger.debug('Fetching position objects from wallet to find address-owned NFT...');
       
-      // Wait a moment for the position to be fully indexed
-      await new Promise(resolve => setTimeout(resolve, 2000));
-      
-      // Fetch all owned objects to find the newly created position
-      const ownedObjects = await this.sdk.fullClient.getOwnedObjects({
-        owner: this.sdk.senderAddress,
-        filter: {
-          StructType: `${this.sdk.sdkOptions.clmm_pool.package_id}::position::Position`
-        },
-        options: {
-          showType: true,
-          showOwner: true,
-          showContent: true
-        }
-      });
-
-      if (!ownedObjects.data || ownedObjects.data.length === 0) {
-        throw new Error('No position objects found in wallet after opening position');
-      }
-
-      // Find the position that matches our pool and tick range
+      // Retry mechanism to wait for position to be indexed
+      const maxRetries = 5;
+      const retryDelay = 2000; // 2 seconds
       let newPositionId = '';
-      for (const obj of ownedObjects.data) {
-        if (obj.data && obj.data.content && 'fields' in obj.data.content) {
-          const fields = obj.data.content.fields as any;
-          
-          // Check if this position matches our pool and tick range
-          if (
-            fields.pool === poolId &&
-            Number(fields.tick_lower_index) === lowerTick &&
-            Number(fields.tick_upper_index) === upperTick &&
-            obj.data.owner && 
-            typeof obj.data.owner === 'object' && 
-            'AddressOwner' in obj.data.owner
-          ) {
-            newPositionId = obj.data.objectId;
-            logger.info(`Found address-owned position NFT: ${newPositionId}`);
-            break;
+      
+      for (let attempt = 0; attempt < maxRetries; attempt++) {
+        if (attempt > 0) {
+          logger.debug(`Retry ${attempt}/${maxRetries} - waiting for position to be indexed...`);
+        }
+        
+        // Wait before fetching (skip on first attempt if it's the first try)
+        if (attempt > 0) {
+          await new Promise(resolve => setTimeout(resolve, retryDelay));
+        } else {
+          // Small initial wait to allow for indexing
+          await new Promise(resolve => setTimeout(resolve, 1000));
+        }
+        
+        // Fetch all owned objects to find the newly created position
+        const ownedObjects = await this.sdk.fullClient.getOwnedObjects({
+          owner: this.sdk.senderAddress,
+          filter: {
+            StructType: `${this.sdk.sdkOptions.clmm_pool.package_id}::position::Position`
+          },
+          options: {
+            showType: true,
+            showOwner: true,
+            showContent: true
           }
+        });
+
+        if (!ownedObjects.data || ownedObjects.data.length === 0) {
+          if (attempt === maxRetries - 1) {
+            throw new Error('No position objects found in wallet after opening position');
+          }
+          continue;
+        }
+
+        // Find the position that matches our pool and tick range
+        for (const obj of ownedObjects.data) {
+          if (obj.data && obj.data.content && 'fields' in obj.data.content) {
+            const fields = obj.data.content.fields as unknown as PositionFields;
+            
+            // Check if this position matches our pool and tick range
+            if (
+              fields.pool === poolId &&
+              Number(fields.tick_lower_index) === lowerTick &&
+              Number(fields.tick_upper_index) === upperTick &&
+              obj.data.owner && 
+              typeof obj.data.owner === 'object' && 
+              'AddressOwner' in obj.data.owner
+            ) {
+              newPositionId = obj.data.objectId;
+              logger.info(`Found address-owned position NFT: ${newPositionId}`);
+              break;
+            }
+          }
+        }
+        
+        if (newPositionId) {
+          break;
         }
       }
 
