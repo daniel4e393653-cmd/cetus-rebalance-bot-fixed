@@ -60,6 +60,12 @@ class CetusRebalanceBot {
   // Minimum threshold in raw units (1 = smallest unit, e.g., 1 = 10^-decimals of a full token)
   // This prevents completely zero amounts but allows single-sided positions
   private readonly MIN_LIQUIDITY_THRESHOLD = new BN(1);
+  
+  // Token balance swap thresholds
+  private readonly BALANCE_SUFFICIENT_PERCENT = 95; // Consider balance sufficient if >= 95% of required
+  private readonly MAX_SWAP_ATTEMPTS = 2; // Maximum swap attempts to prevent infinite loops
+  private readonly SWAP_DEFICIT_BUFFER_PERCENT = 110; // Add 10% buffer when swapping based on deficit
+  private readonly MAX_SWAP_PERCENT = 95; // Use max 95% of available balance when capping swap amount
 
   constructor(config: RebalanceConfig) {
     this.config = config;
@@ -381,7 +387,93 @@ class CetusRebalanceBot {
         throw error;
       }
 
-      // Step 4: Add liquidity to new position using exact removed amounts
+      // Step 3.5: Check wallet balances and perform swap if needed
+      let finalAmountA = removedAmountA;
+      let finalAmountB = removedAmountB;
+      
+      try {
+        logger.info(`Step 3.5: Checking token balance and performing swap if needed`);
+        
+        // Get current wallet balances
+        let walletBalanceA = await this.getWalletBalance(position.coinTypeA);
+        let walletBalanceB = await this.getWalletBalance(position.coinTypeB);
+        
+        logger.info(`Current wallet balances - CoinA: ${walletBalanceA.toString()}, CoinB: ${walletBalanceB.toString()}`);
+        
+        // Calculate optimal amounts that can be deposited based on current balances and price
+        const { optimalA, optimalB } = this.calculateOptimalAmountsFromBalances(
+          pool,
+          lowerTick,
+          upperTick,
+          walletBalanceA,
+          walletBalanceB
+        );
+        
+        logger.info(`Optimal amounts for new range - CoinA: ${optimalA.toString()}, CoinB: ${optimalB.toString()}`);
+        
+        // Check if we need to swap (only swap if we can't meet the optimal ratio)
+        // Swap is needed if our current balance is insufficient (< 95% of optimal)
+        const needsSwap = !this.isBalanceSufficient(walletBalanceA, optimalA) || 
+                         !this.isBalanceSufficient(walletBalanceB, optimalB);
+        
+        if (needsSwap) {
+          let swapAttempts = 0;
+          
+          while (swapAttempts < this.MAX_SWAP_ATTEMPTS) {
+            swapAttempts++;
+            logger.info(`Swap attempt ${swapAttempts}/${this.MAX_SWAP_ATTEMPTS}`);
+            
+            // Perform swap
+            const swapResult = await this.performRebalanceSwap(
+              position.poolId,
+              position.coinTypeA,
+              position.coinTypeB,
+              walletBalanceA,
+              walletBalanceB,
+              optimalA,
+              optimalB,
+              currentTick,
+              lowerTick,
+              upperTick
+            );
+            
+            walletBalanceA = swapResult.newBalanceA;
+            walletBalanceB = swapResult.newBalanceB;
+            
+            // Check if balances are now sufficient
+            const balanceASufficient = this.isBalanceSufficient(walletBalanceA, optimalA);
+            const balanceBSufficient = this.isBalanceSufficient(walletBalanceB, optimalB);
+            
+            if (balanceASufficient && balanceBSufficient) {
+              logger.info('Token balances are now sufficient after swap');
+              break;
+            }
+            
+            if (swapAttempts < this.MAX_SWAP_ATTEMPTS) {
+              logger.info('Balances still insufficient, will attempt another swap');
+            } else {
+              logger.warn('Reached maximum swap attempts, proceeding with current balances');
+            }
+          }
+          
+          // Use wallet balances after swap
+          finalAmountA = walletBalanceA;
+          finalAmountB = walletBalanceB;
+        } else {
+          logger.info('Token balances are sufficient for optimal ratio, no swap needed');
+          // Balances are sufficient - use wallet balances for adding liquidity
+          finalAmountA = walletBalanceA;
+          finalAmountB = walletBalanceB;
+        }
+      } catch (error: any) {
+        logger.error(`Error during balance check/swap: ${error.message || error}`);
+        logger.warn('Proceeding with removed amounts despite swap error');
+        // Fall back to removed amounts if swap fails
+        finalAmountA = removedAmountA;
+        finalAmountB = removedAmountB;
+      }
+
+      // Step 4: Add liquidity to new position using final amounts
       try {
         await this.addLiquidityToPosition(
           newPositionId,
@@ -390,8 +482,8 @@ class CetusRebalanceBot {
           upperTick,
           position.coinTypeA,
           position.coinTypeB,
-          removedAmountA,
-          removedAmountB
+          finalAmountA,
+          finalAmountB
         );
       } catch (error: any) {
         logger.error(`Error adding liquidity: ${error.message || error}`);
@@ -600,6 +692,213 @@ class CetusRebalanceBot {
       return new BN(0); // Preserve zero for single-sided positions
     }
     return amount.lt(threshold) ? threshold : amount;
+  }
+
+  /**
+   * Check if balance is sufficient (>= required amount × BALANCE_SUFFICIENT_PERCENT)
+   * Uses division to avoid potential overflow with large values
+   */
+  private isBalanceSufficient(balance: BN, required: BN): boolean {
+    if (required.isZero()) {
+      return true;
+    }
+    // Check if balance >= required * 0.95
+    // Equivalent to: balance >= required * 95 / 100
+    return balance.gte(required.muln(this.BALANCE_SUFFICIENT_PERCENT).divn(100));
+  }
+
+  /**
+   * Get wallet balance for a specific coin type
+   */
+  private async getWalletBalance(coinType: string): Promise<BN> {
+    try {
+      const coins = await this.sdk.fullClient.getCoins({
+        owner: this.sdk.senderAddress,
+        coinType
+      });
+      
+      if (!coins.data || coins.data.length === 0) {
+        return new BN(0);
+      }
+      
+      // Sum up all coin objects
+      let totalBalance = new BN(0);
+      for (const coin of coins.data) {
+        totalBalance = totalBalance.add(new BN(coin.balance));
+      }
+      
+      return totalBalance;
+    } catch (error: any) {
+      logger.error(`Error fetching wallet balance for ${coinType}: ${error.message || error}`);
+      throw error;
+    }
+  }
+
+  /**
+   * Calculate optimal token amounts for a new position range based on current wallet balances
+   * This determines the ratio and amounts that can be deposited given available tokens
+   */
+  private calculateOptimalAmountsFromBalances(
+    pool: Pool,
+    lowerTick: number,
+    upperTick: number,
+    balanceA: BN,
+    balanceB: BN
+  ): { optimalA: BN; optimalB: BN } {
+    const curSqrtPrice = new BN(pool.current_sqrt_price);
+    const lowerSqrtPrice = TickMath.tickIndexToSqrtPriceX64(lowerTick);
+    const upperSqrtPrice = TickMath.tickIndexToSqrtPriceX64(upperTick);
+    
+    // Calculate liquidity from available balances
+    const liquidityBN = getLiquidityFromCoinAmounts(
+      balanceA,
+      balanceB,
+      lowerSqrtPrice,
+      upperSqrtPrice,
+      curSqrtPrice
+    );
+    
+    // Calculate exact amounts needed for this liquidity
+    const coinAmounts = ClmmPoolUtil.getCoinAmountFromLiquidity(
+      liquidityBN,
+      curSqrtPrice,
+      lowerSqrtPrice,
+      upperSqrtPrice,
+      false // Use roundUp=false to get exact amounts
+    );
+    
+    return {
+      optimalA: coinAmounts.coinA,
+      optimalB: coinAmounts.coinB
+    };
+  }
+
+  /**
+   * Perform a swap to rebalance token amounts
+   * Uses half-value logic when price is inside the range
+   */
+  private async performRebalanceSwap(
+    poolId: string,
+    coinTypeA: string,
+    coinTypeB: string,
+    balanceA: BN,
+    balanceB: BN,
+    optimalA: BN,
+    optimalB: BN,
+    currentTick: number,
+    lowerTick: number,
+    upperTick: number
+  ): Promise<{ newBalanceA: BN; newBalanceB: BN }> {
+    try {
+      logger.info('=== TOKEN IMBALANCE DETECTED ===');
+      logger.info(`Wallet Balance - CoinA: ${balanceA.toString()}, CoinB: ${balanceB.toString()}`);
+      logger.info(`Optimal Amount - CoinA: ${optimalA.toString()}, CoinB: ${optimalB.toString()}`);
+      
+      // Determine swap direction and amount
+      let swapAtoB: boolean;
+      let swapAmount: BN;
+      
+      // Check if price is inside the range
+      const priceInsideRange = currentTick >= lowerTick && currentTick < upperTick;
+      
+      if (optimalA.gt(balanceA)) {
+        // Need more A, swap B -> A
+        swapAtoB = false;
+        const deficit = optimalA.sub(balanceA);
+        
+        if (priceInsideRange) {
+          // Use half-value logic: only swap half of what we have in excess
+          // Check for potential underflow
+          if (balanceB.lte(optimalB)) {
+            logger.warn('Cannot swap: insufficient balance B for half-value logic');
+            logger.info('Token balances are insufficient but no valid swap possible');
+            return { newBalanceA: balanceA, newBalanceB: balanceB };
+          }
+          const excessB = balanceB.sub(optimalB);
+          swapAmount = excessB.divn(2);
+          logger.info(`Price inside range - using half-value rebalance logic`);
+        } else {
+          // Price outside range: swap amount based on deficit
+          swapAmount = deficit.muln(this.SWAP_DEFICIT_BUFFER_PERCENT).divn(100);
+        }
+        
+        logger.info(`Swapping CoinB -> CoinA, amount: ${swapAmount.toString()}`);
+      } else if (optimalB.gt(balanceB)) {
+        // Need more B, swap A -> B
+        swapAtoB = true;
+        const deficit = optimalB.sub(balanceB);
+        
+        if (priceInsideRange) {
+          // Use half-value logic: only swap half of what we have in excess
+          // Check for potential underflow
+          if (balanceA.lte(optimalA)) {
+            logger.warn('Cannot swap: insufficient balance A for half-value logic');
+            logger.info('Token balances are insufficient but no valid swap possible');
+            return { newBalanceA: balanceA, newBalanceB: balanceB };
+          }
+          const excessA = balanceA.sub(optimalA);
+          swapAmount = excessA.divn(2);
+          logger.info(`Price inside range - using half-value rebalance logic`);
+        } else {
+          // Price outside range: swap amount based on deficit
+          swapAmount = deficit.muln(this.SWAP_DEFICIT_BUFFER_PERCENT).divn(100);
+        }
+        
+        logger.info(`Swapping CoinA -> CoinB, amount: ${swapAmount.toString()}`);
+      } else {
+        // No swap needed - balances are sufficient
+        logger.info('Token balances are sufficient, no swap needed');
+        return { newBalanceA: balanceA, newBalanceB: balanceB };
+      }
+      
+      // Safety check: ensure swap amount is positive and not too large
+      if (swapAmount.lte(new BN(0))) {
+        logger.warn('Calculated swap amount is zero or negative, skipping swap');
+        return { newBalanceA: balanceA, newBalanceB: balanceB };
+      }
+      
+      const availableAmount = swapAtoB ? balanceA : balanceB;
+      if (swapAmount.gt(availableAmount)) {
+        logger.warn(`Swap amount ${swapAmount.toString()} exceeds available balance ${availableAmount.toString()}, capping to available`);
+        swapAmount = availableAmount.muln(this.MAX_SWAP_PERCENT).divn(100);
+      }
+      
+      // Perform the swap
+      const slippageTolerance = new Percentage(
+        new BN(Math.floor(this.config.slippagePercent * 100)),
+        new BN(10000)
+      );
+      
+      // Calculate amount limit with slippage (minimum output)
+      const amountLimit = slippageTolerance.subtractFrom(swapAmount);
+      
+      const swapParams = {
+        pool_id: poolId,
+        coinTypeA,
+        coinTypeB,
+        a2b: swapAtoB,
+        by_amount_in: true,
+        amount: swapAmount.toString(),
+        amount_limit: amountLimit.toString()
+      };
+      
+      logger.info(`Executing swap transaction...`);
+      const swapTx = await this.sdk.Swap.createSwapTransactionPayload(swapParams);
+      await this.executeTransaction(swapTx, 'Swap Tokens');
+      
+      logger.info('Swap completed successfully');
+      
+      // Fetch updated balances
+      const newBalanceA = await this.getWalletBalance(coinTypeA);
+      const newBalanceB = await this.getWalletBalance(coinTypeB);
+      
+      logger.info(`Updated Balance - CoinA: ${newBalanceA.toString()}, CoinB: ${newBalanceB.toString()}`);
+      
+      return { newBalanceA, newBalanceB };
+    } catch (error: any) {
+      logger.error(`Error performing rebalance swap: ${error.message || error}`);
+      throw error;
+    }
   }
 
   /**
