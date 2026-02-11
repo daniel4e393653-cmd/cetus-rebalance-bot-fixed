@@ -55,6 +55,9 @@ class CetusRebalanceBot {
   private currentRpcIndex: number = 0;
   private poolCache: Map<string, { pool: Pool; timestamp: number }> = new Map();
   private readonly POOL_CACHE_TTL = 5000; // 5 seconds cache
+  // Minimum threshold in raw units (1 = smallest unit, e.g., 1 = 10^-decimals of a full token)
+  // This prevents completely zero amounts but allows single-sided positions
+  private readonly MIN_LIQUIDITY_THRESHOLD = new BN(1);
 
   constructor(config: RebalanceConfig) {
     this.config = config;
@@ -511,6 +514,16 @@ class CetusRebalanceBot {
   }
 
   /**
+   * Apply minimum threshold to avoid completely zero amounts while preserving single-sided positions
+   */
+  private applyMinimumThreshold(amount: BN, threshold: BN): BN {
+    if (amount.isZero()) {
+      return new BN(0); // Preserve zero for single-sided positions
+    }
+    return amount.lt(threshold) ? threshold : amount;
+  }
+
+  /**
    * Add liquidity to a position
    */
   private async addLiquidityToPosition(
@@ -526,6 +539,30 @@ class CetusRebalanceBot {
       logger.info(`Step 4/4: Adding liquidity to position ${positionId}`);
       
       const pool = await this.getPoolWithCache(poolId);
+      
+      // FIX 1: Ensure correct token ordering by using pool's canonical order
+      const poolCoinTypeA = pool.coinTypeA;
+      const poolCoinTypeB = pool.coinTypeB;
+      
+      // Use corrected coin types to avoid parameter reassignment issues
+      // Note: In normal flow, coinTypes are already from pool (see getWalletPositions method)
+      // This validation is a safety check in case of direct API usage
+      let correctedCoinTypeA = coinTypeA;
+      let correctedCoinTypeB = coinTypeB;
+      
+      if (coinTypeA !== poolCoinTypeA || coinTypeB !== poolCoinTypeB) {
+        // Safety check: ensure input tokens match pool tokens (not just swapped)
+        if ((coinTypeA !== poolCoinTypeA && coinTypeA !== poolCoinTypeB) ||
+            (coinTypeB !== poolCoinTypeB && coinTypeB !== poolCoinTypeA)) {
+          throw new Error(`Invalid coin types. Pool uses ${poolCoinTypeA} and ${poolCoinTypeB}`);
+        }
+        
+        logger.warn(`Token order mismatch detected. Pool expects: A=${poolCoinTypeA}, B=${poolCoinTypeB}`);
+        logger.warn(`Correcting to use pool's canonical order...`);
+        correctedCoinTypeA = poolCoinTypeA;
+        correctedCoinTypeB = poolCoinTypeB;
+      }
+      
       const curSqrtPrice = new BN(pool.current_sqrt_price);
       const lowerSqrtPrice = TickMath.tickIndexToSqrtPriceX64(lowerTick);
       const upperSqrtPrice = TickMath.tickIndexToSqrtPriceX64(upperTick);
@@ -536,34 +573,51 @@ class CetusRebalanceBot {
         new BN(10000)
       );
 
+      // FIX 3: Use roundUp=true for adding liquidity (calculating max amounts)
       const coinAmounts = ClmmPoolUtil.getCoinAmountFromLiquidity(
         liquidityBN,
         curSqrtPrice,
         lowerSqrtPrice,
         upperSqrtPrice,
-        false
+        true
       );
 
+      // FIX 3: Use roundUp=true for adding liquidity
       const { tokenMaxA, tokenMaxB } = adjustForCoinSlippage(
         coinAmounts,
         slippageTolerance,
-        false
+        true
       );
 
+      // FIX 2: Validate amounts are not zero
+      // Note: In concentrated liquidity, one amount can be zero if the position is entirely
+      // above or below the current price (single-sided liquidity). This is valid.
+      if (tokenMaxA.isZero() && tokenMaxB.isZero()) {
+        throw new Error('Both token amounts are zero. Cannot add liquidity.');
+      }
+      
+      // Apply minimum threshold only to non-zero amounts
+      const safeMaxA = this.applyMinimumThreshold(tokenMaxA, this.MIN_LIQUIDITY_THRESHOLD);
+      const safeMaxB = this.applyMinimumThreshold(tokenMaxB, this.MIN_LIQUIDITY_THRESHOLD);
+
+      logger.debug(`Calculated amounts: maxA=${safeMaxA.toString()}, maxB=${safeMaxB.toString()}`);
+
       const addLiquidityParams = {
-        coinTypeA,
-        coinTypeB,
+        coinTypeA: correctedCoinTypeA,
+        coinTypeB: correctedCoinTypeB,
         pool_id: poolId,
         pos_id: positionId,
         tick_lower: lowerTick.toString(),
         tick_upper: upperTick.toString(),
         delta_liquidity: liquidity,
-        max_amount_a: tokenMaxA.toString(),
-        max_amount_b: tokenMaxB.toString(),
+        max_amount_a: safeMaxA.toString(),
+        max_amount_b: safeMaxB.toString(),
         collect_fee: false,
         rewarder_coin_types: []
       };
 
+      // SDK handles coin selection and splitting automatically from wallet balance
+      // This addresses proper coin management and slippage protection
       const tx = await this.sdk.Position.createAddLiquidityPayload(addLiquidityParams);
       
       await this.executeTransaction(tx, 'Add Liquidity');
