@@ -60,6 +60,11 @@ class CetusRebalanceBot {
   // Minimum threshold in raw units (1 = smallest unit, e.g., 1 = 10^-decimals of a full token)
   // This prevents completely zero amounts but allows single-sided positions
   private readonly MIN_LIQUIDITY_THRESHOLD = new BN(1);
+  
+  // Token balance swap thresholds
+  private readonly SWAP_TOLERANCE_PERCENT = 105; // 5% tolerance to avoid unnecessary swaps
+  private readonly BALANCE_SUFFICIENT_PERCENT = 95; // Consider balance sufficient if >= 95% of required
+  private readonly MAX_SWAP_ATTEMPTS = 2; // Maximum swap attempts to prevent infinite loops
 
   constructor(config: RebalanceConfig) {
     this.config = config;
@@ -406,19 +411,16 @@ class CetusRebalanceBot {
         logger.info(`Required amounts for new range - CoinA: ${requiredA.toString()}, CoinB: ${requiredB.toString()}`);
         
         // Check if we need to swap (with a small tolerance to avoid unnecessary swaps)
-        const toleranceFactor = 105; // 5% tolerance
         const needsSwap = 
-          (requiredA.gt(new BN(0)) && walletBalanceA.muln(100).lt(requiredA.muln(toleranceFactor))) ||
-          (requiredB.gt(new BN(0)) && walletBalanceB.muln(100).lt(requiredB.muln(toleranceFactor)));
+          (requiredA.gt(new BN(0)) && walletBalanceA.muln(100).lt(requiredA.muln(this.SWAP_TOLERANCE_PERCENT))) ||
+          (requiredB.gt(new BN(0)) && walletBalanceB.muln(100).lt(requiredB.muln(this.SWAP_TOLERANCE_PERCENT)));
         
         if (needsSwap) {
-          // Maximum swap attempts to prevent infinite loops
-          const MAX_SWAP_ATTEMPTS = 2;
           let swapAttempts = 0;
           
-          while (swapAttempts < MAX_SWAP_ATTEMPTS) {
+          while (swapAttempts < this.MAX_SWAP_ATTEMPTS) {
             swapAttempts++;
-            logger.info(`Swap attempt ${swapAttempts}/${MAX_SWAP_ATTEMPTS}`);
+            logger.info(`Swap attempt ${swapAttempts}/${this.MAX_SWAP_ATTEMPTS}`);
             
             // Perform swap
             const swapResult = await this.performRebalanceSwap(
@@ -438,15 +440,15 @@ class CetusRebalanceBot {
             walletBalanceB = swapResult.newBalanceB;
             
             // Check if balances are now sufficient
-            const balanceASufficient = requiredA.isZero() || walletBalanceA.gte(requiredA.muln(95).divn(100));
-            const balanceBSufficient = requiredB.isZero() || walletBalanceB.gte(requiredB.muln(95).divn(100));
+            const balanceASufficient = requiredA.isZero() || walletBalanceA.gte(requiredA.muln(this.BALANCE_SUFFICIENT_PERCENT).divn(100));
+            const balanceBSufficient = requiredB.isZero() || walletBalanceB.gte(requiredB.muln(this.BALANCE_SUFFICIENT_PERCENT).divn(100));
             
             if (balanceASufficient && balanceBSufficient) {
               logger.info('Token balances are now sufficient after swap');
               break;
             }
             
-            if (swapAttempts < MAX_SWAP_ATTEMPTS) {
+            if (swapAttempts < this.MAX_SWAP_ATTEMPTS) {
               logger.info('Balances still insufficient, will attempt another swap');
             } else {
               logger.warn('Reached maximum swap attempts, proceeding with current balances');
@@ -792,6 +794,12 @@ class CetusRebalanceBot {
         
         if (priceInsideRange) {
           // Use half-value logic: only swap half of what we have in excess
+          // Check for potential underflow
+          if (balanceB.lte(requiredB)) {
+            logger.warn('Cannot swap: insufficient balance B for half-value logic');
+            logger.info('Token balances are insufficient but no valid swap possible');
+            return { newBalanceA: balanceA, newBalanceB: balanceB };
+          }
           const excessB = balanceB.sub(requiredB);
           swapAmount = excessB.divn(2);
           logger.info(`Price inside range - using half-value rebalance logic`);
@@ -808,6 +816,12 @@ class CetusRebalanceBot {
         
         if (priceInsideRange) {
           // Use half-value logic: only swap half of what we have in excess
+          // Check for potential underflow
+          if (balanceA.lte(requiredA)) {
+            logger.warn('Cannot swap: insufficient balance A for half-value logic');
+            logger.info('Token balances are insufficient but no valid swap possible');
+            return { newBalanceA: balanceA, newBalanceB: balanceB };
+          }
           const excessA = balanceA.sub(requiredA);
           swapAmount = excessA.divn(2);
           logger.info(`Price inside range - using half-value rebalance logic`);
