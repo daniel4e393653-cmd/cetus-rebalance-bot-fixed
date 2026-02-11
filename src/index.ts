@@ -469,40 +469,54 @@ class CetusRebalanceBot {
       
       const result = await this.executeTransaction(tx, 'Open Position');
       
-      // Extract position ID from transaction result
-      let newPositionId = '';
+      // After opening position, we need to fetch the actual address-owned position NFT
+      // from getOwnedObjects, as the transaction might return wrapped objects
+      logger.debug('Fetching position objects from wallet to find address-owned NFT...');
       
-      if (result.effects && result.effects.created) {
-        for (const created of result.effects.created) {
-          if (created.reference && created.reference.objectId) {
-            try {
-              const obj = await this.sdk.fullClient.getObject({
-                id: created.reference.objectId,
-                options: { showType: true }
-              });
-              if (obj.data?.type?.includes('Position')) {
-                newPositionId = created.reference.objectId;
-                break;
-              }
-            } catch (e) {
-              // Continue checking other objects
-            }
-          }
+      // Wait a moment for the position to be fully indexed
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      
+      // Fetch all owned objects to find the newly created position
+      const ownedObjects = await this.sdk.fullClient.getOwnedObjects({
+        owner: this.sdk.senderAddress,
+        filter: {
+          StructType: `${this.sdk.sdkOptions.clmm_pool.package_id}::position::Position`
+        },
+        options: {
+          showType: true,
+          showOwner: true,
+          showContent: true
         }
+      });
+
+      if (!ownedObjects.data || ownedObjects.data.length === 0) {
+        throw new Error('No position objects found in wallet after opening position');
       }
 
-      if (!newPositionId && result.effects?.created) {
-        // Fallback: try to find position in created objects
-        for (const created of result.effects.created) {
-          if (created.reference?.objectId) {
-            newPositionId = created.reference.objectId;
+      // Find the position that matches our pool and tick range
+      let newPositionId = '';
+      for (const obj of ownedObjects.data) {
+        if (obj.data && obj.data.content && 'fields' in obj.data.content) {
+          const fields = obj.data.content.fields as any;
+          
+          // Check if this position matches our pool and tick range
+          if (
+            fields.pool === poolId &&
+            Number(fields.tick_lower_index) === lowerTick &&
+            Number(fields.tick_upper_index) === upperTick &&
+            obj.data.owner && 
+            typeof obj.data.owner === 'object' && 
+            'AddressOwner' in obj.data.owner
+          ) {
+            newPositionId = obj.data.objectId;
+            logger.info(`Found address-owned position NFT: ${newPositionId}`);
             break;
           }
         }
       }
 
       if (!newPositionId) {
-        throw new Error('Could not find new position ID in transaction result');
+        throw new Error('Could not find address-owned position NFT in wallet after opening position');
       }
 
       logger.info(`New position opened: ${newPositionId}`);
