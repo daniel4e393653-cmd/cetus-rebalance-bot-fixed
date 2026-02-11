@@ -52,6 +52,7 @@ class CetusRebalanceBot {
   private keypair: Ed25519Keypair;
   private config: RebalanceConfig;
   private isRunning: boolean = false;
+  private isRebalancing: boolean = false; // Prevent concurrent rebalance operations
   private lastCheckTime: Date | null = null;
   private currentRpcIndex: number = 0;
   private poolCache: Map<string, { pool: Pool; timestamp: number }> = new Map();
@@ -300,6 +301,7 @@ class CetusRebalanceBot {
 
     try {
       logger.info(`=== STARTING REBALANCE FOR POSITION ${position.positionId} ===`);
+      logger.info(`Position liquidity: ${position.liquidity}`);
       
       const pool = await this.getPoolWithCache(position.poolId);
       const currentTick = Number(pool.current_tick_index);
@@ -317,31 +319,63 @@ class CetusRebalanceBot {
       logger.info(`New range: [${lowerTick}, ${upperTick}]`);
       logger.info(`Original range width: ${originalRangeWidth}`);
 
-      // Step 1: Remove all liquidity and collect fees
-      await this.removeAllLiquidity(position);
+      const hasLiquidity = position.liquidity !== '0' && new BN(position.liquidity).gt(new BN(0));
 
-      // Step 2: Close the old position
-      await this.closePosition(position);
+      // FIX A & B: Only remove liquidity if position has liquidity > 0
+      if (hasLiquidity) {
+        try {
+          // Step 1: Remove all liquidity and collect fees
+          await this.removeAllLiquidity(position);
+        } catch (error: any) {
+          logger.error(`Error removing liquidity: ${error.message || error}`);
+          throw error;
+        }
+
+        try {
+          // Step 2: Close the old position
+          await this.closePosition(position);
+        } catch (error: any) {
+          logger.error(`Error closing position: ${error.message || error}`);
+          throw error;
+        }
+      } else {
+        logger.info(`Position has zero liquidity, skipping remove_liquidity and close_position steps`);
+      }
 
       // Step 3: Open new position
-      const newPositionId = await this.openNewPosition(
-        position.poolId,
-        lowerTick,
-        upperTick,
-        position.coinTypeA,
-        position.coinTypeB
-      );
+      let newPositionId: string;
+      try {
+        newPositionId = await this.openNewPosition(
+          position.poolId,
+          lowerTick,
+          upperTick,
+          position.coinTypeA,
+          position.coinTypeB
+        );
+      } catch (error: any) {
+        logger.error(`Error opening new position: ${error.message || error}`);
+        throw error;
+      }
 
-      // Step 4: Add liquidity to new position
-      await this.addLiquidityToPosition(
-        newPositionId,
-        position.poolId,
-        position.liquidity,
-        lowerTick,
-        upperTick,
-        position.coinTypeA,
-        position.coinTypeB
-      );
+      // Step 4: Add liquidity to new position (only if we had liquidity before)
+      if (hasLiquidity) {
+        try {
+          await this.addLiquidityToPosition(
+            newPositionId,
+            position.poolId,
+            position.liquidity,
+            lowerTick,
+            upperTick,
+            position.coinTypeA,
+            position.coinTypeB
+          );
+        } catch (error: any) {
+          logger.error(`Error adding liquidity: ${error.message || error}`);
+          throw error;
+        }
+      } else {
+        logger.info(`Skipping add_liquidity step as original position had zero liquidity`);
+      }
 
       logger.info(`=== REBALANCE COMPLETED SUCCESSFULLY ===`);
       logger.info(`New position ID: ${newPositionId}`);
@@ -358,11 +392,20 @@ class CetusRebalanceBot {
     try {
       logger.info(`Step 1/4: Removing liquidity from position ${position.positionId}`);
       
+      // FIX E: Log liquidity before removal
+      const liquidityBN = new BN(position.liquidity);
+      logger.info(`Position liquidity (raw): ${position.liquidity}`);
+      logger.info(`Position liquidity (BN): ${liquidityBN.toString()}`);
+      
+      // FIX B: Verify liquidity is not zero
+      if (liquidityBN.isZero()) {
+        throw new Error('Cannot remove liquidity: position liquidity is zero');
+      }
+      
       const pool = await this.getPoolWithCache(position.poolId);
       const curSqrtPrice = new BN(pool.current_sqrt_price);
       const lowerSqrtPrice = TickMath.tickIndexToSqrtPriceX64(position.tickLower);
       const upperSqrtPrice = TickMath.tickIndexToSqrtPriceX64(position.tickUpper);
-      const liquidity = new BN(position.liquidity);
       
       const slippageTolerance = new Percentage(
         new BN(Math.floor(this.config.slippagePercent * 100)),
@@ -370,7 +413,7 @@ class CetusRebalanceBot {
       );
 
       const coinAmounts = ClmmPoolUtil.getCoinAmountFromLiquidity(
-        liquidity,
+        liquidityBN,
         curSqrtPrice,
         lowerSqrtPrice,
         upperSqrtPrice,
@@ -383,10 +426,13 @@ class CetusRebalanceBot {
         false
       );
 
+      // FIX E: Log calculated amounts
+      logger.debug(`Calculated min amounts: A=${tokenMaxA.toString()}, B=${tokenMaxB.toString()}`);
+
       const removeLiquidityParams = {
         coinTypeA: position.coinTypeA,
         coinTypeB: position.coinTypeB,
-        delta_liquidity: position.liquidity,
+        delta_liquidity: position.liquidity, // FIX B: Use exact liquidity as string (u128 compatible)
         min_amount_a: tokenMaxA.toString(),
         min_amount_b: tokenMaxB.toString(),
         pool_id: position.poolId,
@@ -394,6 +440,13 @@ class CetusRebalanceBot {
         rewarder_coin_types: [],
         collect_fee: true
       };
+
+      // FIX E: Log transaction inputs
+      logger.debug(`Remove liquidity params: ${JSON.stringify({
+        delta_liquidity: removeLiquidityParams.delta_liquidity,
+        min_amount_a: removeLiquidityParams.min_amount_a,
+        min_amount_b: removeLiquidityParams.min_amount_b
+      })}`);
 
       const tx = await this.sdk.Position.removeLiquidityTransactionPayload(removeLiquidityParams);
       
@@ -535,7 +588,7 @@ class CetusRebalanceBot {
       
       const pool = await this.getPoolWithCache(poolId);
       
-      // FIX 1: Ensure correct token ordering by using pool's canonical order
+      // FIX D: Ensure correct token ordering by using pool's canonical order
       const poolCoinTypeA = pool.coinTypeA;
       const poolCoinTypeB = pool.coinTypeB;
       
@@ -568,7 +621,7 @@ class CetusRebalanceBot {
         new BN(10000)
       );
 
-      // FIX 3: Use roundUp=true for adding liquidity (calculating max amounts)
+      // FIX D: Use roundUp=true for adding liquidity (calculating max amounts)
       const coinAmounts = ClmmPoolUtil.getCoinAmountFromLiquidity(
         liquidityBN,
         curSqrtPrice,
@@ -577,14 +630,14 @@ class CetusRebalanceBot {
         true
       );
 
-      // FIX 3: Use roundUp=true for adding liquidity
+      // FIX D: Use roundUp=true for adding liquidity
       const { tokenMaxA, tokenMaxB } = adjustForCoinSlippage(
         coinAmounts,
         slippageTolerance,
         true
       );
 
-      // FIX 2: Validate amounts are not zero
+      // Validate amounts are not zero
       // Note: In concentrated liquidity, one amount can be zero if the position is entirely
       // above or below the current price (single-sided liquidity). This is valid.
       if (tokenMaxA.isZero() && tokenMaxB.isZero()) {
@@ -595,7 +648,31 @@ class CetusRebalanceBot {
       const safeMaxA = this.applyMinimumThreshold(tokenMaxA, this.MIN_LIQUIDITY_THRESHOLD);
       const safeMaxB = this.applyMinimumThreshold(tokenMaxB, this.MIN_LIQUIDITY_THRESHOLD);
 
-      logger.debug(`Calculated amounts: maxA=${safeMaxA.toString()}, maxB=${safeMaxB.toString()}`);
+      // FIX E: Log coin balances and amounts before adding liquidity
+      logger.info(`Adding liquidity with calculated amounts: A=${safeMaxA.toString()}, B=${safeMaxB.toString()}`);
+      
+      // Check wallet balances
+      try {
+        const coinsA = await this.sdk.fullClient.getCoins({
+          owner: this.sdk.senderAddress,
+          coinType: correctedCoinTypeA
+        });
+        const coinsB = await this.sdk.fullClient.getCoins({
+          owner: this.sdk.senderAddress,
+          coinType: correctedCoinTypeB
+        });
+        
+        const totalBalanceA = coinsA.data.reduce((sum, coin) => sum.add(new BN(coin.balance)), new BN(0));
+        const totalBalanceB = coinsB.data.reduce((sum, coin) => sum.add(new BN(coin.balance)), new BN(0));
+        
+        logger.info(`Wallet balance - CoinA: ${totalBalanceA.toString()}, CoinB: ${totalBalanceB.toString()}`);
+        
+        if (totalBalanceA.lt(safeMaxA) || totalBalanceB.lt(safeMaxB)) {
+          logger.warn(`Insufficient balance: Need A=${safeMaxA.toString()}, B=${safeMaxB.toString()}`);
+        }
+      } catch (balanceError) {
+        logger.warn(`Could not check balances: ${balanceError}`);
+      }
 
       const addLiquidityParams = {
         coinTypeA: correctedCoinTypeA,
@@ -611,8 +688,17 @@ class CetusRebalanceBot {
         rewarder_coin_types: []
       };
 
-      // SDK handles coin selection and splitting automatically from wallet balance
-      // This addresses proper coin management and slippage protection
+      // FIX E: Log transaction inputs
+      logger.debug(`Add liquidity params: ${JSON.stringify({
+        delta_liquidity: addLiquidityParams.delta_liquidity,
+        max_amount_a: addLiquidityParams.max_amount_a,
+        max_amount_b: addLiquidityParams.max_amount_b,
+        tick_lower: addLiquidityParams.tick_lower,
+        tick_upper: addLiquidityParams.tick_upper
+      })}`);
+
+      // FIX D: SDK handles coin selection and splitting automatically from wallet balance
+      // This uses the correct pool_script_v2 call with proper coin objects
       const tx = await this.sdk.Position.createAddLiquidityPayload(addLiquidityParams);
       
       await this.executeTransaction(tx, 'Add Liquidity');
@@ -665,6 +751,14 @@ class CetusRebalanceBot {
    * Main check and rebalance loop
    */
   async checkAndRebalance(): Promise<void> {
+    // FIX C: Prevent concurrent execution
+    if (this.isRebalancing) {
+      logger.warn('Rebalance operation already in progress, skipping this cycle');
+      return;
+    }
+
+    this.isRebalancing = true;
+
     try {
       logger.info('=== Starting position check ===');
       this.lastCheckTime = new Date();
@@ -676,6 +770,7 @@ class CetusRebalanceBot {
         return;
       }
 
+      // FIX F: Wrap each position in try/catch for production safety
       for (const position of positions) {
         try {
           const isOutOfRange = await this.isPositionOutOfRange(position);
@@ -686,18 +781,31 @@ class CetusRebalanceBot {
             logger.info(`  Current range: [${position.tickLower}, ${position.tickUpper}]`);
             logger.info(`  Liquidity: ${position.liquidity}`);
             
+            // FIX C: Check liquidity before attempting rebalance
+            if (position.liquidity === '0' || new BN(position.liquidity).isZero()) {
+              logger.warn(`Position ${position.positionId} has zero liquidity, skipping rebalance`);
+              continue;
+            }
+            
             await this.rebalancePosition(position);
           } else {
             logger.info(`Position ${position.positionId} is IN RANGE`);
           }
         } catch (error: any) {
+          // FIX F: Continue processing other positions even if one fails
           logger.error(`Error processing position ${position.positionId}: ${error.message || error}`);
+          logger.error(`Stack trace: ${error.stack}`);
+          logger.info(`Continuing to next position...`);
         }
       }
 
       logger.info('=== Position check completed ===');
     } catch (error: any) {
       logger.error(`Error in checkAndRebalance: ${error.message || error}`);
+      logger.error(`Stack trace: ${error.stack}`);
+    } finally {
+      // FIX C: Always reset the flag in finally block
+      this.isRebalancing = false;
     }
   }
 
