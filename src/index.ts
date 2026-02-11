@@ -230,6 +230,9 @@ class CetusRebalanceBot {
     try {
       logger.info(`Executing transaction: ${description}`);
       
+      // Set sender address - CRITICAL: Must be set before building/executing transaction
+      tx.setSender(this.sdk.senderAddress);
+      
       // Set gas budget
       tx.setGasBudget(this.config.gasBudget);
       
