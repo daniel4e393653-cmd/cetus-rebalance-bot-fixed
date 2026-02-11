@@ -631,7 +631,7 @@ class CetusRebalanceBot {
         totalBalanceA = coinsA.data.reduce((sum, coin) => sum.add(new BN(coin.balance)), new BN(0));
         totalBalanceB = coinsB.data.reduce((sum, coin) => sum.add(new BN(coin.balance)), new BN(0));
         
-        logger.info(`Wallet balance - TokenA: ${totalBalanceA.toString()}, TokenB: ${totalBalanceB.toString()}`);
+        logger.info(`Wallet balance - CoinA: ${totalBalanceA.toString()}, CoinB: ${totalBalanceB.toString()}`);
       } catch (balanceError) {
         logger.error(`Failed to fetch wallet balances: ${balanceError}`);
         throw balanceError;
@@ -675,7 +675,7 @@ class CetusRebalanceBot {
         true
       );
 
-      logger.info(`Token amounts from liquidity - TokenA: ${coinAmounts.coinA.toString()}, TokenB: ${coinAmounts.coinB.toString()}`);
+      logger.info(`Token amounts from liquidity - CoinA: ${coinAmounts.coinA.toString()}, CoinB: ${coinAmounts.coinB.toString()}`);
 
       // Apply slippage tolerance (roundUp=true for adding liquidity)
       const { tokenMaxA, tokenMaxB } = adjustForCoinSlippage(
@@ -688,7 +688,7 @@ class CetusRebalanceBot {
       const safeMaxA = this.applyMinimumThreshold(tokenMaxA, this.MIN_LIQUIDITY_THRESHOLD);
       const safeMaxB = this.applyMinimumThreshold(tokenMaxB, this.MIN_LIQUIDITY_THRESHOLD);
 
-      logger.info(`Final amounts with slippage - TokenA: ${safeMaxA.toString()}, TokenB: ${safeMaxB.toString()}`);
+      logger.info(`Final amounts with slippage - CoinA: ${safeMaxA.toString()}, CoinB: ${safeMaxB.toString()}`);
 
       // Validate both amounts are greater than zero before building transaction
       // The Move contract (repay_add_liquidity) requires both amounts to be > 0
@@ -699,8 +699,8 @@ class CetusRebalanceBot {
 
       // Double-check we have sufficient balance
       if (totalBalanceA.lt(safeMaxA) || totalBalanceB.lt(safeMaxB)) {
-        logger.warn(`Insufficient wallet balance after calculation: have A=${totalBalanceA.toString()}, B=${totalBalanceB.toString()}; need A=${safeMaxA.toString()}, B=${safeMaxB.toString()}`);
-        logger.warn(`This should not happen - recalculating with reduced amounts`);
+        logger.warn(`Insufficient wallet balance after calculation: have CoinA=${totalBalanceA.toString()}, CoinB=${totalBalanceB.toString()}; need CoinA=${safeMaxA.toString()}, CoinB=${safeMaxB.toString()}`);
+        logger.warn(`Skipping add_liquidity to prevent transaction failure`);
         return;
       }
 
