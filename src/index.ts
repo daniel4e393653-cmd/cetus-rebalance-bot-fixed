@@ -743,16 +743,14 @@ class CetusRebalanceBot {
           if (attempt < maxRetries - 1) {
             await new Promise(resolve => setTimeout(resolve, 1500));
             continue;
+          } else {
+            // Last attempt failed, throw the error
+            throw new Error(`Transaction ${digest} not confirmed after ${maxRetries} attempts`);
           }
         } else {
           // For any other error, throw immediately
           throw error;
         }
-      }
-      
-      // Delay before next retry
-      if (attempt < maxRetries - 1) {
-        await new Promise(resolve => setTimeout(resolve, 1500));
       }
     }
     
