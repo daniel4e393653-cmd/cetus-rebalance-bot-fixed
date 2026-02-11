@@ -514,6 +514,16 @@ class CetusRebalanceBot {
   }
 
   /**
+   * Apply minimum threshold to avoid completely zero amounts while preserving single-sided positions
+   */
+  private applyMinimumThreshold(amount: BN, threshold: BN): BN {
+    if (amount.isZero()) {
+      return new BN(0); // Preserve zero for single-sided positions
+    }
+    return amount.lt(threshold) ? threshold : amount;
+  }
+
+  /**
    * Add liquidity to a position
    */
   private async addLiquidityToPosition(
@@ -535,10 +545,18 @@ class CetusRebalanceBot {
       const poolCoinTypeB = pool.coinTypeB;
       
       // Use corrected coin types to avoid parameter reassignment issues
+      // Note: In normal flow, coinTypes are already from pool (see getWalletPositions line 168-169)
+      // This validation is a safety check in case of direct API usage
       let correctedCoinTypeA = coinTypeA;
       let correctedCoinTypeB = coinTypeB;
       
       if (coinTypeA !== poolCoinTypeA || coinTypeB !== poolCoinTypeB) {
+        // Safety check: ensure input tokens match pool tokens (not just swapped)
+        if ((coinTypeA !== poolCoinTypeA && coinTypeA !== poolCoinTypeB) ||
+            (coinTypeB !== poolCoinTypeB && coinTypeB !== poolCoinTypeA)) {
+          throw new Error(`Invalid coin types. Pool uses ${poolCoinTypeA} and ${poolCoinTypeB}`);
+        }
+        
         logger.warn(`Token order mismatch detected. Pool expects: A=${poolCoinTypeA}, B=${poolCoinTypeB}`);
         logger.warn(`Correcting to use pool's canonical order...`);
         correctedCoinTypeA = poolCoinTypeA;
@@ -580,8 +598,8 @@ class CetusRebalanceBot {
       
       // Apply minimum threshold only to non-zero amounts to prevent complete zeros
       // while still allowing single-sided positions
-      const safeMaxA = tokenMaxA.isZero() ? new BN(0) : (tokenMaxA.lt(this.MIN_LIQUIDITY_THRESHOLD) ? this.MIN_LIQUIDITY_THRESHOLD : tokenMaxA);
-      const safeMaxB = tokenMaxB.isZero() ? new BN(0) : (tokenMaxB.lt(this.MIN_LIQUIDITY_THRESHOLD) ? this.MIN_LIQUIDITY_THRESHOLD : tokenMaxB);
+      const safeMaxA = this.applyMinimumThreshold(tokenMaxA, this.MIN_LIQUIDITY_THRESHOLD);
+      const safeMaxB = this.applyMinimumThreshold(tokenMaxB, this.MIN_LIQUIDITY_THRESHOLD);
 
       logger.debug(`Calculated amounts: maxA=${safeMaxA.toString()}, maxB=${safeMaxB.toString()}`);
 
