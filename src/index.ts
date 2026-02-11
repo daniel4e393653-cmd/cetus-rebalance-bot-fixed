@@ -400,8 +400,8 @@ class CetusRebalanceBot {
         
         logger.info(`Current wallet balances - CoinA: ${walletBalanceA.toString()}, CoinB: ${walletBalanceB.toString()}`);
         
-        // Calculate required amounts for the new range
-        const { requiredA, requiredB } = this.calculateRequiredAmounts(
+        // Calculate optimal amounts that can be deposited based on current balances and price
+        const { optimalA, optimalB } = this.calculateOptimalAmountsFromBalances(
           pool,
           lowerTick,
           upperTick,
@@ -409,11 +409,12 @@ class CetusRebalanceBot {
           walletBalanceB
         );
         
-        logger.info(`Required amounts for new range - CoinA: ${requiredA.toString()}, CoinB: ${requiredB.toString()}`);
+        logger.info(`Optimal amounts for new range - CoinA: ${optimalA.toString()}, CoinB: ${optimalB.toString()}`);
         
-        // Check if we need to swap (only swap if deficit is significant, > 5%)
-        const needsSwap = !this.isBalanceSufficient(walletBalanceA, requiredA) || 
-                         !this.isBalanceSufficient(walletBalanceB, requiredB);
+        // Check if we need to swap (only swap if we can't meet the optimal ratio)
+        // Swap is needed if our current balance is insufficient (< 95% of optimal)
+        const needsSwap = !this.isBalanceSufficient(walletBalanceA, optimalA) || 
+                         !this.isBalanceSufficient(walletBalanceB, optimalB);
         
         if (needsSwap) {
           let swapAttempts = 0;
@@ -429,8 +430,8 @@ class CetusRebalanceBot {
               position.coinTypeB,
               walletBalanceA,
               walletBalanceB,
-              requiredA,
-              requiredB,
+              optimalA,
+              optimalB,
               currentTick,
               lowerTick,
               upperTick
@@ -440,8 +441,8 @@ class CetusRebalanceBot {
             walletBalanceB = swapResult.newBalanceB;
             
             // Check if balances are now sufficient
-            const balanceASufficient = this.isBalanceSufficient(walletBalanceA, requiredA);
-            const balanceBSufficient = this.isBalanceSufficient(walletBalanceB, requiredB);
+            const balanceASufficient = this.isBalanceSufficient(walletBalanceA, optimalA);
+            const balanceBSufficient = this.isBalanceSufficient(walletBalanceB, optimalB);
             
             if (balanceASufficient && balanceBSufficient) {
               logger.info('Token balances are now sufficient after swap');
@@ -459,10 +460,10 @@ class CetusRebalanceBot {
           finalAmountA = walletBalanceA;
           finalAmountB = walletBalanceB;
         } else {
-          logger.info('Token balances are sufficient, no swap needed');
-          // Use the removed amounts if sufficient, otherwise use wallet balances
-          finalAmountA = walletBalanceA.gte(removedAmountA) ? removedAmountA : walletBalanceA;
-          finalAmountB = walletBalanceB.gte(removedAmountB) ? removedAmountB : walletBalanceB;
+          logger.info('Token balances are sufficient for optimal ratio, no swap needed');
+          // Balances are sufficient - use wallet balances for adding liquidity
+          finalAmountA = walletBalanceA;
+          finalAmountB = walletBalanceB;
         }
       } catch (error: any) {
         logger.error(`Error during balance check/swap: ${error.message || error}`);
@@ -695,12 +696,15 @@ class CetusRebalanceBot {
 
   /**
    * Check if balance is sufficient (>= required amount × BALANCE_SUFFICIENT_PERCENT)
+   * Uses division to avoid potential overflow with large values
    */
   private isBalanceSufficient(balance: BN, required: BN): boolean {
     if (required.isZero()) {
       return true;
     }
-    return balance.muln(100).gte(required.muln(this.BALANCE_SUFFICIENT_PERCENT));
+    // Check if balance >= required * 0.95
+    // Equivalent to: balance >= required * 95 / 100
+    return balance.gte(required.muln(this.BALANCE_SUFFICIENT_PERCENT).divn(100));
   }
 
   /**
@@ -731,16 +735,16 @@ class CetusRebalanceBot {
   }
 
   /**
-   * Calculate required token amounts for a new position range
-   * Returns the optimal amounts based on current price and available liquidity
+   * Calculate optimal token amounts for a new position range based on current wallet balances
+   * This determines the ratio and amounts that can be deposited given available tokens
    */
-  private calculateRequiredAmounts(
+  private calculateOptimalAmountsFromBalances(
     pool: Pool,
     lowerTick: number,
     upperTick: number,
     balanceA: BN,
     balanceB: BN
-  ): { requiredA: BN; requiredB: BN } {
+  ): { optimalA: BN; optimalB: BN } {
     const curSqrtPrice = new BN(pool.current_sqrt_price);
     const lowerSqrtPrice = TickMath.tickIndexToSqrtPriceX64(lowerTick);
     const upperSqrtPrice = TickMath.tickIndexToSqrtPriceX64(upperTick);
@@ -764,8 +768,8 @@ class CetusRebalanceBot {
     );
     
     return {
-      requiredA: coinAmounts.coinA,
-      requiredB: coinAmounts.coinB
+      optimalA: coinAmounts.coinA,
+      optimalB: coinAmounts.coinB
     };
   }
 
@@ -779,8 +783,8 @@ class CetusRebalanceBot {
     coinTypeB: string,
     balanceA: BN,
     balanceB: BN,
-    requiredA: BN,
-    requiredB: BN,
+    optimalA: BN,
+    optimalB: BN,
     currentTick: number,
     lowerTick: number,
     upperTick: number
@@ -788,7 +792,7 @@ class CetusRebalanceBot {
     try {
       logger.info('=== TOKEN IMBALANCE DETECTED ===');
       logger.info(`Wallet Balance - CoinA: ${balanceA.toString()}, CoinB: ${balanceB.toString()}`);
-      logger.info(`Required Amount - CoinA: ${requiredA.toString()}, CoinB: ${requiredB.toString()}`);
+      logger.info(`Optimal Amount - CoinA: ${optimalA.toString()}, CoinB: ${optimalB.toString()}`);
       
       // Determine swap direction and amount
       let swapAtoB: boolean;
@@ -797,20 +801,20 @@ class CetusRebalanceBot {
       // Check if price is inside the range
       const priceInsideRange = currentTick >= lowerTick && currentTick < upperTick;
       
-      if (requiredA.gt(balanceA)) {
+      if (optimalA.gt(balanceA)) {
         // Need more A, swap B -> A
         swapAtoB = false;
-        const deficit = requiredA.sub(balanceA);
+        const deficit = optimalA.sub(balanceA);
         
         if (priceInsideRange) {
           // Use half-value logic: only swap half of what we have in excess
           // Check for potential underflow
-          if (balanceB.lte(requiredB)) {
+          if (balanceB.lte(optimalB)) {
             logger.warn('Cannot swap: insufficient balance B for half-value logic');
             logger.info('Token balances are insufficient but no valid swap possible');
             return { newBalanceA: balanceA, newBalanceB: balanceB };
           }
-          const excessB = balanceB.sub(requiredB);
+          const excessB = balanceB.sub(optimalB);
           swapAmount = excessB.divn(2);
           logger.info(`Price inside range - using half-value rebalance logic`);
         } else {
@@ -819,20 +823,20 @@ class CetusRebalanceBot {
         }
         
         logger.info(`Swapping CoinB -> CoinA, amount: ${swapAmount.toString()}`);
-      } else if (requiredB.gt(balanceB)) {
+      } else if (optimalB.gt(balanceB)) {
         // Need more B, swap A -> B
         swapAtoB = true;
-        const deficit = requiredB.sub(balanceB);
+        const deficit = optimalB.sub(balanceB);
         
         if (priceInsideRange) {
           // Use half-value logic: only swap half of what we have in excess
           // Check for potential underflow
-          if (balanceA.lte(requiredA)) {
+          if (balanceA.lte(optimalA)) {
             logger.warn('Cannot swap: insufficient balance A for half-value logic');
             logger.info('Token balances are insufficient but no valid swap possible');
             return { newBalanceA: balanceA, newBalanceB: balanceB };
           }
-          const excessA = balanceA.sub(requiredA);
+          const excessA = balanceA.sub(optimalA);
           swapAmount = excessA.divn(2);
           logger.info(`Price inside range - using half-value rebalance logic`);
         } else {
