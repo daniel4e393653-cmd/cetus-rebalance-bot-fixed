@@ -55,7 +55,7 @@ class CetusRebalanceBot {
   private currentRpcIndex: number = 0;
   private poolCache: Map<string, { pool: Pool; timestamp: number }> = new Map();
   private readonly POOL_CACHE_TTL = 5000; // 5 seconds cache
-  // Minimum threshold in raw units (1 = 10^-decimals tokens)
+  // Minimum threshold in raw units (1 = smallest unit, e.g., 1 = 10^-decimals of a full token)
   // This prevents completely zero amounts but allows single-sided positions
   private readonly MIN_LIQUIDITY_THRESHOLD = new BN(1);
 
@@ -545,7 +545,7 @@ class CetusRebalanceBot {
       const poolCoinTypeB = pool.coinTypeB;
       
       // Use corrected coin types to avoid parameter reassignment issues
-      // Note: In normal flow, coinTypes are already from pool (see getWalletPositions line 168-169)
+      // Note: In normal flow, coinTypes are already from pool (see getWalletPositions method)
       // This validation is a safety check in case of direct API usage
       let correctedCoinTypeA = coinTypeA;
       let correctedCoinTypeB = coinTypeB;
@@ -596,8 +596,7 @@ class CetusRebalanceBot {
         throw new Error('Both token amounts are zero. Cannot add liquidity.');
       }
       
-      // Apply minimum threshold only to non-zero amounts to prevent complete zeros
-      // while still allowing single-sided positions
+      // Apply minimum threshold only to non-zero amounts
       const safeMaxA = this.applyMinimumThreshold(tokenMaxA, this.MIN_LIQUIDITY_THRESHOLD);
       const safeMaxB = this.applyMinimumThreshold(tokenMaxB, this.MIN_LIQUIDITY_THRESHOLD);
 
@@ -617,9 +616,8 @@ class CetusRebalanceBot {
         rewarder_coin_types: []
       };
 
-      // FIX 4 & 5: SDK handles coin selection automatically if inputCoinA/B not provided
-      // The SDK will select and split coins from wallet balance
-      // For production safety, we rely on SDK's built-in coin management
+      // SDK handles coin selection and splitting automatically from wallet balance
+      // This addresses proper coin management and slippage protection
       const tx = await this.sdk.Position.createAddLiquidityPayload(addLiquidityParams);
       
       await this.executeTransaction(tx, 'Add Liquidity');
