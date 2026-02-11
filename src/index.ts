@@ -64,6 +64,8 @@ class CetusRebalanceBot {
   // Token balance swap thresholds
   private readonly BALANCE_SUFFICIENT_PERCENT = 95; // Consider balance sufficient if >= 95% of required
   private readonly MAX_SWAP_ATTEMPTS = 2; // Maximum swap attempts to prevent infinite loops
+  private readonly SWAP_DEFICIT_BUFFER_PERCENT = 110; // Add 10% buffer when swapping based on deficit
+  private readonly MAX_SWAP_PERCENT = 95; // Use max 95% of available balance when capping swap amount
 
   constructor(config: RebalanceConfig) {
     this.config = config;
@@ -390,7 +392,7 @@ class CetusRebalanceBot {
       let finalAmountB = removedAmountB;
       
       try {
-        logger.info(`Step 3.5/4: Checking token balance and performing swap if needed`);
+        logger.info(`Step 3.5: Checking token balance and performing swap if needed`);
         
         // Get current wallet balances
         let walletBalanceA = await this.getWalletBalance(position.coinTypeA);
@@ -410,10 +412,8 @@ class CetusRebalanceBot {
         logger.info(`Required amounts for new range - CoinA: ${requiredA.toString()}, CoinB: ${requiredB.toString()}`);
         
         // Check if we need to swap (only swap if deficit is significant, > 5%)
-        // Swap if wallet balance < required × 0.95 (i.e., we have less than 95% of what we need)
-        const needsSwap = 
-          (requiredA.gt(new BN(0)) && walletBalanceA.muln(100).lt(requiredA.muln(this.BALANCE_SUFFICIENT_PERCENT))) ||
-          (requiredB.gt(new BN(0)) && walletBalanceB.muln(100).lt(requiredB.muln(this.BALANCE_SUFFICIENT_PERCENT)));
+        const needsSwap = !this.isBalanceSufficient(walletBalanceA, requiredA) || 
+                         !this.isBalanceSufficient(walletBalanceB, requiredB);
         
         if (needsSwap) {
           let swapAttempts = 0;
@@ -440,8 +440,8 @@ class CetusRebalanceBot {
             walletBalanceB = swapResult.newBalanceB;
             
             // Check if balances are now sufficient
-            const balanceASufficient = requiredA.isZero() || walletBalanceA.gte(requiredA.muln(this.BALANCE_SUFFICIENT_PERCENT).divn(100));
-            const balanceBSufficient = requiredB.isZero() || walletBalanceB.gte(requiredB.muln(this.BALANCE_SUFFICIENT_PERCENT).divn(100));
+            const balanceASufficient = this.isBalanceSufficient(walletBalanceA, requiredA);
+            const balanceBSufficient = this.isBalanceSufficient(walletBalanceB, requiredB);
             
             if (balanceASufficient && balanceBSufficient) {
               logger.info('Token balances are now sufficient after swap');
@@ -694,6 +694,16 @@ class CetusRebalanceBot {
   }
 
   /**
+   * Check if balance is sufficient (>= required amount × BALANCE_SUFFICIENT_PERCENT)
+   */
+  private isBalanceSufficient(balance: BN, required: BN): boolean {
+    if (required.isZero()) {
+      return true;
+    }
+    return balance.muln(100).gte(required.muln(this.BALANCE_SUFFICIENT_PERCENT));
+  }
+
+  /**
    * Get wallet balance for a specific coin type
    */
   private async getWalletBalance(coinType: string): Promise<BN> {
@@ -805,7 +815,7 @@ class CetusRebalanceBot {
           logger.info(`Price inside range - using half-value rebalance logic`);
         } else {
           // Price outside range: swap amount based on deficit
-          swapAmount = deficit.muln(110).divn(100); // Add 10% buffer for slippage
+          swapAmount = deficit.muln(this.SWAP_DEFICIT_BUFFER_PERCENT).divn(100);
         }
         
         logger.info(`Swapping CoinB -> CoinA, amount: ${swapAmount.toString()}`);
@@ -827,7 +837,7 @@ class CetusRebalanceBot {
           logger.info(`Price inside range - using half-value rebalance logic`);
         } else {
           // Price outside range: swap amount based on deficit
-          swapAmount = deficit.muln(110).divn(100); // Add 10% buffer for slippage
+          swapAmount = deficit.muln(this.SWAP_DEFICIT_BUFFER_PERCENT).divn(100);
         }
         
         logger.info(`Swapping CoinA -> CoinB, amount: ${swapAmount.toString()}`);
@@ -846,7 +856,7 @@ class CetusRebalanceBot {
       const availableAmount = swapAtoB ? balanceA : balanceB;
       if (swapAmount.gt(availableAmount)) {
         logger.warn(`Swap amount ${swapAmount.toString()} exceeds available balance ${availableAmount.toString()}, capping to available`);
-        swapAmount = availableAmount.muln(this.BALANCE_SUFFICIENT_PERCENT).divn(100); // Use 95% of available to leave some buffer
+        swapAmount = availableAmount.muln(this.MAX_SWAP_PERCENT).divn(100);
       }
       
       // Perform the swap
