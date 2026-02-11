@@ -230,6 +230,9 @@ class CetusRebalanceBot {
     try {
       logger.info(`Executing transaction: ${description}`);
       
+      // Set sender address - CRITICAL: Must be set before building/executing transaction
+      tx.setSender(this.sdk.senderAddress);
+      
       // Set gas budget
       tx.setGasBudget(this.config.gasBudget);
       
@@ -662,8 +665,10 @@ class CetusRebalanceBot {
     logger.info('=== Cetus Rebalance Bot Started ===');
     logger.info('Press Ctrl+C to stop');
 
-    // Run immediately on start
-    this.checkAndRebalance();
+    // Run immediately on start (fire-and-forget with error handling)
+    this.checkAndRebalance().catch((error) => {
+      logger.error(`Unhandled error in initial checkAndRebalance: ${error}`);
+    });
 
     // Schedule periodic checks
     const intervalMs = this.config.checkIntervalSeconds * 1000;
