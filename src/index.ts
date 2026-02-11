@@ -319,7 +319,7 @@ class CetusRebalanceBot {
       logger.info(`New range: [${lowerTick}, ${upperTick}]`);
       logger.info(`Original range width: ${originalRangeWidth}`);
 
-      const hasLiquidity = position.liquidity !== '0' && new BN(position.liquidity).gt(new BN(0));
+      const hasLiquidity = new BN(position.liquidity).gt(new BN(0));
 
       // FIX A & B: Only remove liquidity if position has liquidity > 0
       if (hasLiquidity) {
@@ -358,6 +358,10 @@ class CetusRebalanceBot {
       }
 
       // Step 4: Add liquidity to new position (only if we had liquidity before)
+      // Note: We use the original position's liquidity value. The SDK will calculate
+      // the required coin amounts based on the new price range. If actual balances
+      // differ from calculated amounts due to fees collected, the transaction may fail
+      // with insufficient balance, which is the expected behavior.
       if (hasLiquidity) {
         try {
           await this.addLiquidityToPosition(
@@ -782,7 +786,7 @@ class CetusRebalanceBot {
             logger.info(`  Liquidity: ${position.liquidity}`);
             
             // FIX C: Check liquidity before attempting rebalance
-            if (position.liquidity === '0' || new BN(position.liquidity).isZero()) {
+            if (new BN(position.liquidity).isZero()) {
               logger.warn(`Position ${position.positionId} has zero liquidity, skipping rebalance`);
               continue;
             }
