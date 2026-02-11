@@ -480,13 +480,14 @@ class CetusRebalanceBot {
       }
       
       // Find the created object whose type matches the Cetus Position type
+      // Note: Position types include type parameters like Position<CoinA, CoinB>
       let newPositionId = '';
-      const expectedPositionType = `${this.sdk.sdkOptions.clmm_pool.package_id}::position::Position`;
+      const expectedPositionTypePrefix = `${this.sdk.sdkOptions.clmm_pool.package_id}::position::Position`;
       for (const change of result.objectChanges) {
         if (
           change.type === 'created' &&
           change.objectType &&
-          change.objectType === expectedPositionType
+          change.objectType.startsWith(expectedPositionTypePrefix)
         ) {
           newPositionId = change.objectId;
           logger.info(`Found newly created position object: ${newPositionId}`);
@@ -495,7 +496,8 @@ class CetusRebalanceBot {
       }
       
       if (!newPositionId) {
-        throw new Error(`Could not find Position object in transaction object changes (found ${result.objectChanges.length} changes for pool ${poolId}). Expected type: ${expectedPositionType}`);
+        const foundTypes = result.objectChanges.map(c => c.objectType || 'unknown').join(', ');
+        throw new Error(`Could not find Position object in transaction object changes. Expected type prefix: ${expectedPositionTypePrefix}. Found types: ${foundTypes}`);
       }
 
       logger.info(`New position opened: ${newPositionId}`);
