@@ -62,7 +62,6 @@ class CetusRebalanceBot {
   private readonly MIN_LIQUIDITY_THRESHOLD = new BN(1);
   
   // Token balance swap thresholds
-  private readonly SWAP_TOLERANCE_PERCENT = 105; // 5% tolerance to avoid unnecessary swaps
   private readonly BALANCE_SUFFICIENT_PERCENT = 95; // Consider balance sufficient if >= 95% of required
   private readonly MAX_SWAP_ATTEMPTS = 2; // Maximum swap attempts to prevent infinite loops
 
@@ -410,10 +409,11 @@ class CetusRebalanceBot {
         
         logger.info(`Required amounts for new range - CoinA: ${requiredA.toString()}, CoinB: ${requiredB.toString()}`);
         
-        // Check if we need to swap (with a small tolerance to avoid unnecessary swaps)
+        // Check if we need to swap (only swap if deficit is significant, > 5%)
+        // Swap if wallet balance < required × 0.95 (i.e., we have less than 95% of what we need)
         const needsSwap = 
-          (requiredA.gt(new BN(0)) && walletBalanceA.muln(100).lt(requiredA.muln(this.SWAP_TOLERANCE_PERCENT))) ||
-          (requiredB.gt(new BN(0)) && walletBalanceB.muln(100).lt(requiredB.muln(this.SWAP_TOLERANCE_PERCENT)));
+          (requiredA.gt(new BN(0)) && walletBalanceA.muln(100).lt(requiredA.muln(this.BALANCE_SUFFICIENT_PERCENT))) ||
+          (requiredB.gt(new BN(0)) && walletBalanceB.muln(100).lt(requiredB.muln(this.BALANCE_SUFFICIENT_PERCENT)));
         
         if (needsSwap) {
           let swapAttempts = 0;
@@ -846,7 +846,7 @@ class CetusRebalanceBot {
       const availableAmount = swapAtoB ? balanceA : balanceB;
       if (swapAmount.gt(availableAmount)) {
         logger.warn(`Swap amount ${swapAmount.toString()} exceeds available balance ${availableAmount.toString()}, capping to available`);
-        swapAmount = availableAmount.muln(95).divn(100); // Use 95% of available to leave some buffer
+        swapAmount = availableAmount.muln(this.BALANCE_SUFFICIENT_PERCENT).divn(100); // Use 95% of available to leave some buffer
       }
       
       // Perform the swap
@@ -855,10 +855,8 @@ class CetusRebalanceBot {
         new BN(10000)
       );
       
-      // Calculate amount limit with slippage
-      const amountLimit = swapAtoB 
-        ? slippageTolerance.subtractFrom(swapAmount) // Minimum output when swapping A->B
-        : slippageTolerance.subtractFrom(swapAmount); // Minimum output when swapping B->A
+      // Calculate amount limit with slippage (minimum output)
+      const amountLimit = slippageTolerance.subtractFrom(swapAmount);
       
       const swapParams = {
         pool_id: poolId,
