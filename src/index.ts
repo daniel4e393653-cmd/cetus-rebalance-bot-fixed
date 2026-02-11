@@ -55,6 +55,7 @@ class CetusRebalanceBot {
   private currentRpcIndex: number = 0;
   private poolCache: Map<string, { pool: Pool; timestamp: number }> = new Map();
   private readonly POOL_CACHE_TTL = 5000; // 5 seconds cache
+  private readonly MIN_LIQUIDITY_THRESHOLD = new BN(1); // Minimum amount to avoid dust
 
   constructor(config: RebalanceConfig) {
     this.config = config;
@@ -531,11 +532,15 @@ class CetusRebalanceBot {
       const poolCoinTypeA = pool.coinTypeA;
       const poolCoinTypeB = pool.coinTypeB;
       
+      // Use corrected coin types to avoid parameter reassignment issues
+      let correctedCoinTypeA = coinTypeA;
+      let correctedCoinTypeB = coinTypeB;
+      
       if (coinTypeA !== poolCoinTypeA || coinTypeB !== poolCoinTypeB) {
         logger.warn(`Token order mismatch detected. Pool expects: A=${poolCoinTypeA}, B=${poolCoinTypeB}`);
         logger.warn(`Correcting to use pool's canonical order...`);
-        coinTypeA = poolCoinTypeA;
-        coinTypeB = poolCoinTypeB;
+        correctedCoinTypeA = poolCoinTypeA;
+        correctedCoinTypeB = poolCoinTypeB;
       }
       
       const curSqrtPrice = new BN(pool.current_sqrt_price);
@@ -570,15 +575,14 @@ class CetusRebalanceBot {
       }
       
       // Use a minimum threshold to avoid dust amounts
-      const minAmount = new BN(1);
-      const safeMaxA = tokenMaxA.gt(minAmount) ? tokenMaxA : minAmount;
-      const safeMaxB = tokenMaxB.gt(minAmount) ? tokenMaxB : minAmount;
+      const safeMaxA = tokenMaxA.gt(this.MIN_LIQUIDITY_THRESHOLD) ? tokenMaxA : this.MIN_LIQUIDITY_THRESHOLD;
+      const safeMaxB = tokenMaxB.gt(this.MIN_LIQUIDITY_THRESHOLD) ? tokenMaxB : this.MIN_LIQUIDITY_THRESHOLD;
 
       logger.debug(`Calculated amounts: maxA=${safeMaxA.toString()}, maxB=${safeMaxB.toString()}`);
 
       const addLiquidityParams = {
-        coinTypeA,
-        coinTypeB,
+        coinTypeA: correctedCoinTypeA,
+        coinTypeB: correctedCoinTypeB,
         pool_id: poolId,
         pos_id: positionId,
         tick_lower: lowerTick.toString(),
