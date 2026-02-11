@@ -642,21 +642,24 @@ class CetusRebalanceBot {
         true
       );
 
-      // Validate amounts are not zero
-      // Note: In concentrated liquidity, one amount can be zero if the position is entirely
-      // above or below the current price (single-sided liquidity). This is valid.
-      if (tokenMaxA.isZero() && tokenMaxB.isZero()) {
-        throw new Error('Both token amounts are zero. Cannot add liquidity.');
-      }
-      
       // Apply minimum threshold only to non-zero amounts
       const safeMaxA = this.applyMinimumThreshold(tokenMaxA, this.MIN_LIQUIDITY_THRESHOLD);
       const safeMaxB = this.applyMinimumThreshold(tokenMaxB, this.MIN_LIQUIDITY_THRESHOLD);
+
+      // FIX: Validate both amounts are greater than zero before building transaction
+      // The Move contract (repay_add_liquidity) requires both amounts to be > 0
+      if (safeMaxA.lte(new BN(0)) || safeMaxB.lte(new BN(0))) {
+        logger.warn(`Cannot add liquidity: amountA=${safeMaxA.toString()}, amountB=${safeMaxB.toString()}`);
+        logger.warn(`Skipping add_liquidity as one or both amounts are zero or negative`);
+        return;
+      }
 
       // FIX E: Log coin balances and amounts before adding liquidity
       logger.info(`Adding liquidity with calculated amounts: A=${safeMaxA.toString()}, B=${safeMaxB.toString()}`);
       
       // Check wallet balances
+      let totalBalanceA = new BN(0);
+      let totalBalanceB = new BN(0);
       try {
         const coinsA = await this.sdk.fullClient.getCoins({
           owner: this.sdk.senderAddress,
@@ -667,13 +670,15 @@ class CetusRebalanceBot {
           coinType: correctedCoinTypeB
         });
         
-        const totalBalanceA = coinsA.data.reduce((sum, coin) => sum.add(new BN(coin.balance)), new BN(0));
-        const totalBalanceB = coinsB.data.reduce((sum, coin) => sum.add(new BN(coin.balance)), new BN(0));
+        totalBalanceA = coinsA.data.reduce((sum, coin) => sum.add(new BN(coin.balance)), new BN(0));
+        totalBalanceB = coinsB.data.reduce((sum, coin) => sum.add(new BN(coin.balance)), new BN(0));
         
         logger.info(`Wallet balance - CoinA: ${totalBalanceA.toString()}, CoinB: ${totalBalanceB.toString()}`);
         
         if (totalBalanceA.lt(safeMaxA) || totalBalanceB.lt(safeMaxB)) {
           logger.warn(`Insufficient balance: Need A=${safeMaxA.toString()}, B=${safeMaxB.toString()}`);
+          logger.warn(`Skipping add_liquidity due to insufficient wallet balance`);
+          return;
         }
       } catch (balanceError) {
         logger.warn(`Could not check balances: ${balanceError}`);
