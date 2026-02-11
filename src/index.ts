@@ -502,16 +502,12 @@ class CetusRebalanceBot {
       
       for (let attempt = 0; attempt < this.POSITION_FETCH_MAX_RETRIES; attempt++) {
         if (attempt > 0) {
-          logger.debug(`Retry ${attempt}/${this.POSITION_FETCH_MAX_RETRIES} - waiting for position to be indexed...`);
+          logger.debug(`Attempt ${attempt + 1}/${this.POSITION_FETCH_MAX_RETRIES} - waiting for position to be indexed...`);
         }
         
-        // Wait before fetching (skip on first attempt if it's the first try)
-        if (attempt > 0) {
-          await new Promise(resolve => setTimeout(resolve, this.POSITION_FETCH_RETRY_DELAY));
-        } else {
-          // Small initial wait to allow for indexing
-          await new Promise(resolve => setTimeout(resolve, this.POSITION_FETCH_INITIAL_DELAY));
-        }
+        // Wait before fetching to allow blockchain indexing
+        const delay = attempt === 0 ? this.POSITION_FETCH_INITIAL_DELAY : this.POSITION_FETCH_RETRY_DELAY;
+        await new Promise(resolve => setTimeout(resolve, delay));
         
         // Fetch all owned objects to find the newly created position
         const ownedObjects = await this.sdk.fullClient.getOwnedObjects({
