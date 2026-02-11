@@ -719,12 +719,11 @@ class CetusRebalanceBot {
    * Wait for a transaction to be confirmed
    */
   private async waitForTransaction(digest: string): Promise<void> {
-    let attempts = 0;
-    const maxAttempts = 60;
+    const maxRetries = 10;
     
     logger.debug(`Waiting for transaction ${digest}...`);
     
-    while (attempts < maxAttempts) {
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
       try {
         const tx = await this.sdk.fullClient.getTransactionBlock({
           digest,
@@ -738,18 +737,24 @@ class CetusRebalanceBot {
           throw new Error(`Transaction failed: ${tx.effects.status.error}`);
         }
       } catch (error: any) {
-        if (error.message?.includes('not found')) {
-          // Transaction not found yet, wait and retry
+        // Check if this is the specific RPC indexing error
+        if (error.message?.includes('Could not find the referenced transaction')) {
+          // Transaction not indexed yet, retry after delay
+          if (attempt < maxRetries - 1) {
+            await new Promise(resolve => setTimeout(resolve, 1500));
+            continue;
+          } else {
+            // Last attempt failed, throw the error
+            throw new Error(`Transaction ${digest} not confirmed after ${maxRetries} attempts`);
+          }
         } else {
+          // For any other error, throw immediately
           throw error;
         }
       }
-      
-      await new Promise(resolve => setTimeout(resolve, 1000));
-      attempts++;
     }
     
-    throw new Error(`Transaction ${digest} not confirmed after ${maxAttempts} attempts`);
+    throw new Error(`Transaction ${digest} not confirmed after ${maxRetries} attempts`);
   }
 
   /**
