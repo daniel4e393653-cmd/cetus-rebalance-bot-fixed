@@ -55,7 +55,9 @@ class CetusRebalanceBot {
   private currentRpcIndex: number = 0;
   private poolCache: Map<string, { pool: Pool; timestamp: number }> = new Map();
   private readonly POOL_CACHE_TTL = 5000; // 5 seconds cache
-  private readonly MIN_LIQUIDITY_THRESHOLD = new BN(1); // Minimum amount to avoid dust
+  // Minimum threshold in raw units (1 = 10^-decimals tokens)
+  // This prevents completely zero amounts but allows single-sided positions
+  private readonly MIN_LIQUIDITY_THRESHOLD = new BN(1);
 
   constructor(config: RebalanceConfig) {
     this.config = config;
@@ -570,13 +572,16 @@ class CetusRebalanceBot {
       );
 
       // FIX 2: Validate amounts are not zero
+      // Note: In concentrated liquidity, one amount can be zero if the position is entirely
+      // above or below the current price (single-sided liquidity). This is valid.
       if (tokenMaxA.isZero() && tokenMaxB.isZero()) {
         throw new Error('Both token amounts are zero. Cannot add liquidity.');
       }
       
-      // Use a minimum threshold to avoid dust amounts
-      const safeMaxA = tokenMaxA.gt(this.MIN_LIQUIDITY_THRESHOLD) ? tokenMaxA : this.MIN_LIQUIDITY_THRESHOLD;
-      const safeMaxB = tokenMaxB.gt(this.MIN_LIQUIDITY_THRESHOLD) ? tokenMaxB : this.MIN_LIQUIDITY_THRESHOLD;
+      // Apply minimum threshold only to non-zero amounts to prevent complete zeros
+      // while still allowing single-sided positions
+      const safeMaxA = tokenMaxA.isZero() ? new BN(0) : (tokenMaxA.lt(this.MIN_LIQUIDITY_THRESHOLD) ? this.MIN_LIQUIDITY_THRESHOLD : tokenMaxA);
+      const safeMaxB = tokenMaxB.isZero() ? new BN(0) : (tokenMaxB.lt(this.MIN_LIQUIDITY_THRESHOLD) ? this.MIN_LIQUIDITY_THRESHOLD : tokenMaxB);
 
       logger.debug(`Calculated amounts: maxA=${safeMaxA.toString()}, maxB=${safeMaxB.toString()}`);
 
