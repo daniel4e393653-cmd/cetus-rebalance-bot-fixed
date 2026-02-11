@@ -335,9 +335,10 @@ class CetusRebalanceBot {
           logger.info(`Stored removed amounts - CoinA: ${removedAmountA.toString()}, CoinB: ${removedAmountB.toString()}`);
           
           // Safety check: If either amount is zero, skip rebalance
+          // The Move contract repay_add_liquidity requires BOTH amounts > 0; single-sided liquidity causes MoveAbort
           if (removedAmountA.isZero() || removedAmountB.isZero()) {
             logger.warn(`One or both token amounts are zero (CoinA: ${removedAmountA.toString()}, CoinB: ${removedAmountB.toString()})`);
-            logger.warn(`Skipping rebalance to prevent division by zero in liquidity calculation`);
+            logger.warn(`Skipping rebalance: Move contract requires both token amounts > 0 for add_liquidity`);
             
             // Still need to close the position since we already removed liquidity
             try {
@@ -650,9 +651,10 @@ class CetusRebalanceBot {
       logger.info(`Current sqrtPrice: ${curSqrtPrice.toString()}`);
       logger.info(`Using exact token amounts - CoinA: ${amountA.toString()}, CoinB: ${amountB.toString()}`);
       
-      // Check if both amounts are zero
-      if (amountA.isZero() && amountB.isZero()) {
-        logger.warn(`Skipping add_liquidity: Both token amounts are zero`);
+      // Safety check: The Move contract requires both amounts > 0
+      // This is a defensive check in case this function is called directly
+      if (amountA.isZero() || amountB.isZero()) {
+        logger.warn(`Skipping add_liquidity: One or both amounts are zero - Move contract requires both > 0`);
         return;
       }
       
