@@ -56,7 +56,9 @@ class CetusRebalanceBot {
   private lastCheckTime: Date | null = null;
   private currentRpcIndex: number = 0;
   private poolCache: Map<string, { pool: Pool; timestamp: number }> = new Map();
+  private lastRebalanceTimestamp: Map<string, number> = new Map();
   private readonly POOL_CACHE_TTL = 5000; // 5 seconds cache
+  private readonly REBALANCE_COOLDOWN_MS = 60000; // 60 seconds minimum between rebalances per position
   // Minimum threshold in raw units (1 = smallest unit, e.g., 1 = 10^-decimals of a full token)
   // This prevents completely zero amounts but allows single-sided positions
   private readonly MIN_LIQUIDITY_THRESHOLD = new BN(1);
@@ -237,7 +239,7 @@ class CetusRebalanceBot {
   /**
    * Execute a transaction with proper signing and simulation
    */
-  private async executeTransaction(tx: Transaction, description: string): Promise<{ digest: string; effects?: any; objectChanges?: any[] }> {
+  private async executeTransaction(tx: Transaction, description: string): Promise<{ digest: string; effects?: any; objectChanges?: any[]; balanceChanges?: any[] }> {
     try {
       logger.info(`Executing transaction: ${description}`);
       
@@ -276,7 +278,8 @@ class CetusRebalanceBot {
         options: {
           showEffects: true,
           showObjectChanges: true,
-          showEvents: true
+          showEvents: true,
+          showBalanceChanges: true
         }
       });
       
@@ -289,7 +292,7 @@ class CetusRebalanceBot {
       // Wait for confirmation
       await this.waitForTransaction(result.digest);
       
-      return { digest: result.digest, effects: result.effects, objectChanges: result.objectChanges || [] };
+      return { digest: result.digest, effects: result.effects, objectChanges: result.objectChanges || [], balanceChanges: (result as any).balanceChanges || [] };
     } catch (error: any) {
       logger.error(`Transaction execution failed: ${error.message || error}`);
       throw error;
@@ -467,10 +470,9 @@ class CetusRebalanceBot {
         }
       } catch (error: any) {
         logger.error(`Error during balance check/swap: ${error.message || error}`);
-        logger.warn('Proceeding with removed amounts despite swap error');
-        // Fall back to removed amounts if swap fails
-        finalAmountA = removedAmountA;
-        finalAmountB = removedAmountB;
+        logger.error('Swap failed — aborting rebalance to prevent token imbalance issues');
+        logger.warn(`New position ${newPositionId} was created but has no liquidity added`);
+        return;
       }
 
       // Step 4: Add liquidity to new position using final amounts
@@ -570,12 +572,59 @@ class CetusRebalanceBot {
 
       const tx = await this.sdk.Position.removeLiquidityTransactionPayload(removeLiquidityParams);
       
-      await this.executeTransaction(tx, 'Remove Liquidity');
+      const result = await this.executeTransaction(tx, 'Remove Liquidity');
       
       logger.info(`Liquidity removed successfully`);
       
-      // Return the exact amounts that were removed
-      return { amountA: expectedAmountA, amountB: expectedAmountB };
+      // PART 1 FIX: Parse on-chain balanceChanges to get real returned amounts
+      // Do NOT rely on math calculations — only trust on-chain data
+      let onChainAmountA = new BN(0);
+      let onChainAmountB = new BN(0);
+      
+      try {
+        // Fetch full transaction block with balance changes
+        const txBlock = await this.sdk.fullClient.getTransactionBlock({
+          digest: result.digest,
+          options: { showEffects: true, showBalanceChanges: true }
+        });
+        
+        const balanceChanges = (txBlock as any).balanceChanges || result.balanceChanges || [];
+        logger.info(`Balance changes count: ${balanceChanges.length}`);
+        
+        for (const change of balanceChanges) {
+          // Only consider positive changes to our wallet (tokens returned to us)
+          const amount = BigInt(change.amount || '0');
+          if (amount <= BigInt(0)) continue;
+          
+          const coinType = change.coinType || '';
+          
+          // Normalize coin type for comparison (remove leading 0x if needed)
+          const normalizedCoinType = coinType.replace(/^0x0*/, '0x');
+          const normalizedCoinTypeA = position.coinTypeA.replace(/^0x0*/, '0x');
+          const normalizedCoinTypeB = position.coinTypeB.replace(/^0x0*/, '0x');
+          
+          if (normalizedCoinType === normalizedCoinTypeA) {
+            onChainAmountA = onChainAmountA.add(new BN(amount.toString()));
+            logger.info(`Detected CoinA balance change: +${amount.toString()}`);
+          } else if (normalizedCoinType === normalizedCoinTypeB) {
+            onChainAmountB = onChainAmountB.add(new BN(amount.toString()));
+            logger.info(`Detected CoinB balance change: +${amount.toString()}`);
+          }
+        }
+        
+        logger.info(`On-chain removed amounts - CoinA: ${onChainAmountA.toString()}, CoinB: ${onChainAmountB.toString()}`);
+      } catch (parseError: any) {
+        logger.warn(`Failed to parse balance changes: ${parseError.message || parseError}`);
+        logger.warn(`Falling back to calculated amounts`);
+      }
+      
+      // Use on-chain amounts if available, otherwise fall back to calculated amounts
+      const finalAmountA = onChainAmountA.gt(new BN(0)) ? onChainAmountA : expectedAmountA;
+      const finalAmountB = onChainAmountB.gt(new BN(0)) ? onChainAmountB : expectedAmountB;
+      
+      logger.info(`Final removed amounts - CoinA: ${finalAmountA.toString()}, CoinB: ${finalAmountB.toString()}`);
+      
+      return { amountA: finalAmountA, amountB: finalAmountB };
     } catch (error: any) {
       logger.error(`Error removing liquidity: ${error.message || error}`);
       throw error;
@@ -801,49 +850,80 @@ class CetusRebalanceBot {
       // Check if price is inside the range
       const priceInsideRange = currentTick >= lowerTick && currentTick < upperTick;
       
-      if (optimalA.gt(balanceA)) {
-        // Need more A, swap B -> A
+      if (priceInsideRange) {
+        // PART 3: Smart ratio logic — compute approximate values using pool price
+        // Use sqrtPrice to estimate price: price ≈ (sqrtPrice / 2^64)^2
+        // For value comparison, we use a simplified approach:
+        // valueA ≈ balanceA * price, valueB ≈ balanceB (price denominated in B)
+        const pool = await this.getPoolWithCache(poolId);
+        const curSqrtPrice = new BN(pool.current_sqrt_price);
+        
+        // Approximate price as a rational number: price ≈ sqrtPrice^2 / 2^128
+        // valueA (in B terms) ≈ balanceA * sqrtPrice^2 / 2^128
+        // valueB (in B terms) ≈ balanceB
+        // To avoid overflow, use: valueA_scaled = balanceA * (sqrtPrice / 2^64) * (sqrtPrice / 2^64)
+        // We'll scale down to prevent BN overflow
+        const sqrtPriceHigh = curSqrtPrice.shrn(32); // scale down for safe multiplication
+        const valueAScaled = balanceA.mul(sqrtPriceHigh).mul(sqrtPriceHigh).shrn(64); // final shift for 2^(32+32) = 2^64 remaining
+        const valueBScaled = balanceB.shln(0); // no scaling needed
+        
+        const totalValue = valueAScaled.add(valueBScaled);
+        const targetValueEach = totalValue.divn(2);
+        
+        logger.info(`Price inside range - smart ratio logic`);
+        logger.info(`ValueA (scaled): ${valueAScaled.toString()}, ValueB (scaled): ${valueBScaled.toString()}`);
+        logger.info(`Total value: ${totalValue.toString()}, Target each: ${targetValueEach.toString()}`);
+        
+        // 1% safety buffer: only swap 99% of the excess
+        const SAFETY_BUFFER_PERCENT = 99;
+        
+        if (valueAScaled.gt(targetValueEach)) {
+          // Excess A, swap A -> B
+          swapAtoB = true;
+          const excessValue = valueAScaled.sub(targetValueEach);
+          // Convert excess value back to token A amount: excessA = excessValue / price
+          // excessA = excessValue * 2^64 / (sqrtPriceHigh^2) — but we need to avoid division by zero
+          const priceFactor = sqrtPriceHigh.mul(sqrtPriceHigh);
+          if (priceFactor.isZero()) {
+            logger.warn('Cannot compute swap amount: price factor is zero');
+            return { newBalanceA: balanceA, newBalanceB: balanceB };
+          }
+          swapAmount = excessValue.shln(64).div(priceFactor).muln(SAFETY_BUFFER_PERCENT).divn(100);
+          
+          // Cap swap to never exceed available balance
+          if (swapAmount.gt(balanceA)) {
+            swapAmount = balanceA.muln(this.MAX_SWAP_PERCENT).divn(100);
+          }
+          logger.info(`Swapping CoinA -> CoinB, amount: ${swapAmount.toString()}`);
+        } else if (valueBScaled.gt(targetValueEach)) {
+          // Excess B, swap B -> A
+          swapAtoB = false;
+          const excessValue = valueBScaled.sub(targetValueEach);
+          // excessB is directly the excess value (already in B terms)
+          swapAmount = excessValue.muln(SAFETY_BUFFER_PERCENT).divn(100);
+          
+          // Cap swap to never exceed available balance
+          if (swapAmount.gt(balanceB)) {
+            swapAmount = balanceB.muln(this.MAX_SWAP_PERCENT).divn(100);
+          }
+          logger.info(`Swapping CoinB -> CoinA, amount: ${swapAmount.toString()}`);
+        } else {
+          logger.info('Token values are balanced, no swap needed');
+          return { newBalanceA: balanceA, newBalanceB: balanceB };
+        }
+      } else if (optimalA.gt(balanceA)) {
+        // Price outside range: Need more A, swap B -> A
         swapAtoB = false;
         const deficit = optimalA.sub(balanceA);
-        
-        if (priceInsideRange) {
-          // Use half-value logic: only swap half of what we have in excess
-          // Check for potential underflow
-          if (balanceB.lte(optimalB)) {
-            logger.warn('Cannot swap: insufficient balance B for half-value logic');
-            logger.info('Token balances are insufficient but no valid swap possible');
-            return { newBalanceA: balanceA, newBalanceB: balanceB };
-          }
-          const excessB = balanceB.sub(optimalB);
-          swapAmount = excessB.divn(2);
-          logger.info(`Price inside range - using half-value rebalance logic`);
-        } else {
-          // Price outside range: swap amount based on deficit
-          swapAmount = deficit.muln(this.SWAP_DEFICIT_BUFFER_PERCENT).divn(100);
-        }
-        
+        swapAmount = deficit.muln(this.SWAP_DEFICIT_BUFFER_PERCENT).divn(100);
+        logger.info(`Price outside range - deficit-based swap`);
         logger.info(`Swapping CoinB -> CoinA, amount: ${swapAmount.toString()}`);
       } else if (optimalB.gt(balanceB)) {
-        // Need more B, swap A -> B
+        // Price outside range: Need more B, swap A -> B
         swapAtoB = true;
         const deficit = optimalB.sub(balanceB);
-        
-        if (priceInsideRange) {
-          // Use half-value logic: only swap half of what we have in excess
-          // Check for potential underflow
-          if (balanceA.lte(optimalA)) {
-            logger.warn('Cannot swap: insufficient balance A for half-value logic');
-            logger.info('Token balances are insufficient but no valid swap possible');
-            return { newBalanceA: balanceA, newBalanceB: balanceB };
-          }
-          const excessA = balanceA.sub(optimalA);
-          swapAmount = excessA.divn(2);
-          logger.info(`Price inside range - using half-value rebalance logic`);
-        } else {
-          // Price outside range: swap amount based on deficit
-          swapAmount = deficit.muln(this.SWAP_DEFICIT_BUFFER_PERCENT).divn(100);
-        }
-        
+        swapAmount = deficit.muln(this.SWAP_DEFICIT_BUFFER_PERCENT).divn(100);
+        logger.info(`Price outside range - deficit-based swap`);
         logger.info(`Swapping CoinA -> CoinB, amount: ${swapAmount.toString()}`);
       } else {
         // No swap needed - balances are sufficient
@@ -1128,6 +1208,14 @@ class CetusRebalanceBot {
             logger.info(`  Current range: [${position.tickLower}, ${position.tickUpper}]`);
             logger.info(`  Liquidity: ${position.liquidity}`);
             
+            // PART 4: Enforce per-position cooldown to prevent infinite loops
+            const lastRebalance = this.lastRebalanceTimestamp.get(position.positionId);
+            if (lastRebalance && (Date.now() - lastRebalance) < this.REBALANCE_COOLDOWN_MS) {
+              const remainingSec = Math.ceil((this.REBALANCE_COOLDOWN_MS - (Date.now() - lastRebalance)) / 1000);
+              logger.warn(`Position ${position.positionId} is in cooldown (${remainingSec}s remaining), skipping rebalance`);
+              continue;
+            }
+            
             // FIX C: Early check for zero liquidity to avoid unnecessary work
             // (rebalancePosition also checks this, but this saves a function call)
             if (new BN(position.liquidity).isZero()) {
@@ -1136,6 +1224,26 @@ class CetusRebalanceBot {
             }
             
             await this.rebalancePosition(position);
+            
+            // PART 4: Record rebalance timestamp
+            this.lastRebalanceTimestamp.set(position.positionId, Date.now());
+            
+            // PART 4: Post-rebalance validation — re-fetch positions and verify
+            // If the new position is already in range, log success
+            try {
+              const updatedPositions = await this.getWalletPositions();
+              const newPos = updatedPositions.find(p => p.poolId === position.poolId);
+              if (newPos) {
+                const stillOutOfRange = await this.isPositionOutOfRange(newPos);
+                if (stillOutOfRange) {
+                  logger.warn(`Post-rebalance check: New position ${newPos.positionId} is still out of range`);
+                } else {
+                  logger.info(`Post-rebalance check: New position ${newPos.positionId} is now in range`);
+                }
+              }
+            } catch (postCheckError: any) {
+              logger.warn(`Post-rebalance validation failed: ${postCheckError.message || postCheckError}`);
+            }
           } else {
             logger.info(`Position ${position.positionId} is IN RANGE`);
           }
