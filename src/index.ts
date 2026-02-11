@@ -321,11 +321,33 @@ class CetusRebalanceBot {
 
       const hasLiquidity = new BN(position.liquidity).gt(new BN(0));
 
+      let removedAmountA = new BN(0);
+      let removedAmountB = new BN(0);
+
       // FIX A & B: Only remove liquidity if position has liquidity > 0
       if (hasLiquidity) {
         try {
           // Step 1: Remove all liquidity and collect fees
-          await this.removeAllLiquidity(position);
+          const amounts = await this.removeAllLiquidity(position);
+          removedAmountA = amounts.amountA;
+          removedAmountB = amounts.amountB;
+          
+          logger.info(`Stored removed amounts - CoinA: ${removedAmountA.toString()}, CoinB: ${removedAmountB.toString()}`);
+          
+          // Safety check: If either amount is zero, skip rebalance
+          // The Move contract repay_add_liquidity requires BOTH amounts > 0; single-sided liquidity causes MoveAbort
+          if (removedAmountA.isZero() || removedAmountB.isZero()) {
+            logger.warn(`One or both token amounts are zero (CoinA: ${removedAmountA.toString()}, CoinB: ${removedAmountB.toString()})`);
+            logger.warn(`Skipping rebalance: Move contract requires both token amounts > 0 for add_liquidity`);
+            
+            // Still need to close the position since we already removed liquidity
+            try {
+              await this.closePosition(position);
+            } catch (error: any) {
+              logger.error(`Error closing position: ${error.message || error}`);
+            }
+            return;
+          }
         } catch (error: any) {
           logger.error(`Error removing liquidity: ${error.message || error}`);
           throw error;
@@ -340,6 +362,8 @@ class CetusRebalanceBot {
         }
       } else {
         logger.info(`Position has zero liquidity, skipping remove_liquidity and close_position steps`);
+        logger.warn(`No liquidity to rebalance, aborting rebalance operation`);
+        return;
       }
 
       // Step 3: Open new position
@@ -357,9 +381,7 @@ class CetusRebalanceBot {
         throw error;
       }
 
-      // Step 4: Add liquidity to new position
-      // Calculate liquidity based on current wallet balances instead of using old position's liquidity
-      // This ensures we add the maximum possible liquidity with available tokens
+      // Step 4: Add liquidity to new position using exact removed amounts
       try {
         await this.addLiquidityToPosition(
           newPositionId,
@@ -367,7 +389,9 @@ class CetusRebalanceBot {
           lowerTick,
           upperTick,
           position.coinTypeA,
-          position.coinTypeB
+          position.coinTypeB,
+          removedAmountA,
+          removedAmountB
         );
       } catch (error: any) {
         logger.error(`Error adding liquidity: ${error.message || error}`);
@@ -384,8 +408,9 @@ class CetusRebalanceBot {
 
   /**
    * Remove all liquidity from a position
+   * Returns the exact token amounts that were removed
    */
-  private async removeAllLiquidity(position: PositionInfo): Promise<void> {
+  private async removeAllLiquidity(position: PositionInfo): Promise<{ amountA: BN; amountB: BN }> {
     try {
       logger.info(`Step 1/4: Removing liquidity from position ${position.positionId}`);
       
@@ -426,6 +451,12 @@ class CetusRebalanceBot {
       // FIX E: Log calculated amounts
       logger.debug(`Calculated min amounts: A=${tokenMaxA.toString()}, B=${tokenMaxB.toString()}`);
 
+      // Store the exact expected amounts (without slippage) that will be returned
+      const expectedAmountA = coinAmounts.coinA;
+      const expectedAmountB = coinAmounts.coinB;
+      
+      logger.info(`Expected token amounts to be returned - CoinA: ${expectedAmountA.toString()}, CoinB: ${expectedAmountB.toString()}`);
+
       const removeLiquidityParams = {
         coinTypeA: position.coinTypeA,
         coinTypeB: position.coinTypeB,
@@ -450,6 +481,9 @@ class CetusRebalanceBot {
       await this.executeTransaction(tx, 'Remove Liquidity');
       
       logger.info(`Liquidity removed successfully`);
+      
+      // Return the exact amounts that were removed
+      return { amountA: expectedAmountA, amountB: expectedAmountB };
     } catch (error: any) {
       logger.error(`Error removing liquidity: ${error.message || error}`);
       throw error;
@@ -569,7 +603,7 @@ class CetusRebalanceBot {
   }
 
   /**
-   * Add liquidity to a position
+   * Add liquidity to a position using exact token amounts
    */
   private async addLiquidityToPosition(
     positionId: string,
@@ -577,7 +611,9 @@ class CetusRebalanceBot {
     lowerTick: number,
     upperTick: number,
     coinTypeA: string,
-    coinTypeB: string
+    coinTypeB: string,
+    amountA: BN,
+    amountB: BN
   ): Promise<void> {
     try {
       logger.info(`Step 4/4: Adding liquidity to position ${positionId}`);
@@ -613,47 +649,33 @@ class CetusRebalanceBot {
       logger.info(`Current pool tick: ${currentTick}`);
       logger.info(`Position range: [${lowerTick}, ${upperTick}]`);
       logger.info(`Current sqrtPrice: ${curSqrtPrice.toString()}`);
+      logger.info(`Using exact token amounts - CoinA: ${amountA.toString()}, CoinB: ${amountB.toString()}`);
       
-      // Fetch wallet balances for both tokens
-      let totalBalanceA = new BN(0);
-      let totalBalanceB = new BN(0);
-      
-      try {
-        const coinsA = await this.sdk.fullClient.getCoins({
-          owner: this.sdk.senderAddress,
-          coinType: correctedCoinTypeA
-        });
-        const coinsB = await this.sdk.fullClient.getCoins({
-          owner: this.sdk.senderAddress,
-          coinType: correctedCoinTypeB
-        });
-        
-        totalBalanceA = coinsA.data.reduce((sum, coin) => sum.add(new BN(coin.balance)), new BN(0));
-        totalBalanceB = coinsB.data.reduce((sum, coin) => sum.add(new BN(coin.balance)), new BN(0));
-        
-        logger.info(`Wallet balance - CoinA: ${totalBalanceA.toString()}, CoinB: ${totalBalanceB.toString()}`);
-      } catch (balanceError) {
-        logger.error(`Failed to fetch wallet balances: ${balanceError}`);
-        throw balanceError;
-      }
-      
-      // Check if we have any balance
-      if (totalBalanceA.isZero() && totalBalanceB.isZero()) {
-        logger.warn(`Skipping add_liquidity: Both token balances are zero`);
+      // Safety check: The Move contract requires both amounts > 0
+      // This is a defensive check in case this function is called directly
+      if (amountA.isZero() || amountB.isZero()) {
+        logger.warn(`Skipping add_liquidity: One or both amounts are zero - Move contract requires both > 0`);
         return;
       }
       
-      // Calculate maximum liquidity based on available wallet balances
-      // This considers the current tick position relative to the range
-      const liquidityBN = getLiquidityFromCoinAmounts(
-        totalBalanceA,
-        totalBalanceB,
-        lowerSqrtPrice,
-        upperSqrtPrice,
-        curSqrtPrice
-      );
+      // Calculate liquidity from the exact token amounts provided
+      // Add safety check to prevent division by zero
+      let liquidityBN: BN;
+      try {
+        liquidityBN = getLiquidityFromCoinAmounts(
+          amountA,
+          amountB,
+          lowerSqrtPrice,
+          upperSqrtPrice,
+          curSqrtPrice
+        );
+      } catch (error: any) {
+        logger.error(`Error calculating liquidity from coin amounts: ${error.message || error}`);
+        logger.warn(`Skipping add_liquidity due to calculation error`);
+        return;
+      }
       
-      logger.info(`Calculated liquidity from wallet balances: ${liquidityBN.toString()}`);
+      logger.info(`Calculated liquidity from exact amounts: ${liquidityBN.toString()}`);
       
       if (liquidityBN.isZero()) {
         logger.warn(`Skipping add_liquidity: Calculated liquidity is zero`);
@@ -694,13 +716,6 @@ class CetusRebalanceBot {
       // The Move contract (repay_add_liquidity) requires both amounts to be > 0
       if (safeMaxA.lte(new BN(0)) || safeMaxB.lte(new BN(0))) {
         logger.warn(`Skipping add_liquidity: amountA=${safeMaxA.toString()}, amountB=${safeMaxB.toString()} - Move contract requires both amounts > 0`);
-        return;
-      }
-
-      // Double-check we have sufficient balance
-      if (totalBalanceA.lt(safeMaxA) || totalBalanceB.lt(safeMaxB)) {
-        logger.warn(`Insufficient wallet balance after calculation: have CoinA=${totalBalanceA.toString()}, CoinB=${totalBalanceB.toString()}; need CoinA=${safeMaxA.toString()}, CoinB=${safeMaxB.toString()}`);
-        logger.warn(`Skipping add_liquidity to prevent transaction failure`);
         return;
       }
 

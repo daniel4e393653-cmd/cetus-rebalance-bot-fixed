@@ -49,26 +49,66 @@ export function getLiquidityFromCoinAmounts(
   sqrtPriceUpper: BN,
   sqrtPriceCurrent: BN
 ): BN {
+  // Safety check: Prevent division by zero
+  if (sqrtPriceUpper.lte(sqrtPriceLower)) {
+    throw new Error('Invalid tick range: sqrtPriceUpper must be greater than sqrtPriceLower');
+  }
+  
   if (sqrtPriceCurrent.lt(sqrtPriceLower)) {
     // All in token A
+    if (amountA.isZero()) {
+      return new BN(0);
+    }
     const numerator = amountA.mul(sqrtPriceLower).mul(sqrtPriceUpper);
     const denominator = sqrtPriceUpper.sub(sqrtPriceLower).shln(64);
+    if (denominator.isZero()) {
+      throw new Error('Division by zero: invalid denominator in liquidity calculation (below range)');
+    }
     return numerator.div(denominator);
   } else if (sqrtPriceCurrent.gte(sqrtPriceUpper)) {
     // All in token B
+    if (amountB.isZero()) {
+      return new BN(0);
+    }
     const numerator = amountB.shln(64);
     const denominator = sqrtPriceUpper.sub(sqrtPriceLower);
+    if (denominator.isZero()) {
+      throw new Error('Division by zero: invalid denominator in liquidity calculation (above range)');
+    }
     return numerator.div(denominator);
   } else {
     // Mixed - use the smaller liquidity
-    const liquidityA = amountA
-      .mul(sqrtPriceCurrent)
-      .mul(sqrtPriceUpper)
-      .div(sqrtPriceUpper.sub(sqrtPriceCurrent).shln(64));
+    let liquidityA = new BN(0);
+    let liquidityB = new BN(0);
     
-    const liquidityB = amountB
-      .shln(64)
-      .div(sqrtPriceCurrent.sub(sqrtPriceLower));
+    if (!amountA.isZero()) {
+      const denominatorA = sqrtPriceUpper.sub(sqrtPriceCurrent).shln(64);
+      if (denominatorA.isZero()) {
+        throw new Error('Division by zero: invalid denominatorA in liquidity calculation (in range)');
+      }
+      liquidityA = amountA
+        .mul(sqrtPriceCurrent)
+        .mul(sqrtPriceUpper)
+        .div(denominatorA);
+    }
+    
+    if (!amountB.isZero()) {
+      const denominatorB = sqrtPriceCurrent.sub(sqrtPriceLower);
+      if (denominatorB.isZero()) {
+        throw new Error('Division by zero: invalid denominatorB in liquidity calculation (in range)');
+      }
+      liquidityB = amountB
+        .shln(64)
+        .div(denominatorB);
+    }
+    
+    // If one amount is zero, use the non-zero liquidity
+    if (liquidityA.isZero()) {
+      return liquidityB;
+    }
+    if (liquidityB.isZero()) {
+      return liquidityA;
+    }
     
     return liquidityA.lt(liquidityB) ? liquidityA : liquidityB;
   }
