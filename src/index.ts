@@ -476,16 +476,17 @@ class CetusRebalanceBot {
       logger.debug('Extracting position object ID from transaction effects...');
       
       if (!result.objectChanges || result.objectChanges.length === 0) {
-        throw new Error('No object changes found in transaction result');
+        throw new Error('Failed to retrieve position from transaction: no object changes returned. This may indicate the transaction did not complete successfully.');
       }
       
-      // Find the created object whose type includes "Position"
+      // Find the created object whose type matches the Cetus Position type
       let newPositionId = '';
+      const expectedPositionType = `${this.sdk.sdkOptions.clmm_pool.package_id}::position::Position`;
       for (const change of result.objectChanges) {
         if (
           change.type === 'created' &&
           change.objectType &&
-          change.objectType.includes('::position::Position')
+          change.objectType === expectedPositionType
         ) {
           newPositionId = change.objectId;
           logger.info(`Found newly created position object: ${newPositionId}`);
@@ -494,7 +495,7 @@ class CetusRebalanceBot {
       }
       
       if (!newPositionId) {
-        throw new Error('Could not find Position object in transaction object changes');
+        throw new Error(`Could not find Position object in transaction object changes (found ${result.objectChanges.length} changes for pool ${poolId}). Expected type: ${expectedPositionType}`);
       }
 
       logger.info(`New position opened: ${newPositionId}`);
